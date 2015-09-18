@@ -22,6 +22,12 @@ ENV GOARM 5
 ENV GOOS    linux
 ENV GOARCH  amd64
 
+ENV http_proxy=http://z00209874:zgy2015euler.@172.18.32.221:8080
+ENV https_proxy=http://z00209874:zgy2015euler.@172.18.32.221:8080
+ENV no_proxy=127.0.0.1
+
+RUN git config --global http.sslverify false
+
 # work around 64MB tmpfs size in Docker 1.6
 ENV TMPDIR /tmp.k8s
 
