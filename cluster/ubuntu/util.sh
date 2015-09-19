@@ -426,9 +426,9 @@ function kube-down {
   for i in ${nodes}; do
     {
       echo "Cleaning on node ${i#*@}"
+      ssh -t $i 'pgrep etcd && sudo -p "[sudo] password for cleaning etcd data: " service etcd stop && sudo rm -rf /infra*'
       # Delete the files in order to generate a clean environment, so you can change each node's role at next deployment.
       ssh -t $i 'sudo rm -f /opt/bin/kube* /etc/init/kube* /etc/init.d/kube* /etc/default/kube*; sudo rm -rf ~/kube /var/lib/kubelet'
-      ssh -t $i 'pgrep etcd && sudo -p "[sudo] password for cleaning etcd data: " service etcd stop && sudo rm -rf /infra*'
     }
   done
   wait
