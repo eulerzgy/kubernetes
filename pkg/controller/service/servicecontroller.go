@@ -320,7 +320,7 @@ func (s *ServiceController) createLoadBalancerIfNeeded(namespacedName types.Name
 
 		// The load balancer doesn't exist yet, so create it.
 		s.eventRecorder.Event(service, "CreatingLoadBalancer", "Creating load balancer")
-		err := s.createExternalLoadBalancer(service)
+		err := s.createLoadBalancer(service)
 		if err != nil {
 			return fmt.Errorf("failed to create external load balancer for service %s: %v", namespacedName, err), retryable
 		}
@@ -368,7 +368,7 @@ func (s *ServiceController) persistUpdate(service *api.Service) error {
 	return err
 }
 
-func (s *ServiceController) createExternalLoadBalancer(service *api.Service) error {
+func (s *ServiceController) createLoadBalancer(service *api.Service) error {
 	ports, err := getPortsForLB(service)
 	if err != nil {
 		return err
