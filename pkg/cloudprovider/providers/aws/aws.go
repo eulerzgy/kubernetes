@@ -30,13 +30,13 @@ import (
 	"sync"
 	"time"
 
-	"code.google.com/p/gcfg"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/elb"
+	"github.com/scalingdata/gcfg"
 
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/cloudprovider"
@@ -172,6 +172,7 @@ type InstanceGroupInfo interface {
 type AWSCloud struct {
 	awsServices      AWSServices
 	ec2              EC2
+	elb              ELB
 	asg              ASG
 	cfg              *AWSCloudConfig
 	availabilityZone string
@@ -183,8 +184,6 @@ type AWSCloud struct {
 	selfAWSInstance *awsInstance
 
 	mutex sync.Mutex
-	// Protects elbClients
-	elbClients map[string]ELB
 }
 
 type AWSCloudConfig struct {
@@ -234,23 +233,6 @@ func (p *awsSDKProvider) Autoscaling(regionName string) (ASG, error) {
 
 func (p *awsSDKProvider) Metadata() AWSMetadata {
 	return &awsSdkMetadata{}
-}
-
-// Builds an ELB client for the specified region
-func (s *AWSCloud) getELBClient(regionName string) (ELB, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	elbClient, found := s.elbClients[regionName]
-	if !found {
-		var err error
-		elbClient, err = s.awsServices.LoadBalancing(regionName)
-		if err != nil {
-			return nil, err
-		}
-		s.elbClients[regionName] = elbClient
-	}
-	return elbClient, nil
 }
 
 func stringPointerArray(orig []string) []*string {
@@ -475,6 +457,7 @@ func init() {
 			[]credentials.Provider{
 				&credentials.EnvProvider{},
 				&credentials.EC2RoleProvider{},
+				&credentials.SharedCredentialsProvider{},
 			})
 		aws := &awsSDKProvider{creds: creds}
 		return newAWSCloud(config, aws)
@@ -565,6 +548,11 @@ func newAWSCloud(config io.Reader, awsServices AWSServices) (*AWSCloud, error) {
 		return nil, fmt.Errorf("error creating AWS EC2 client: %v", err)
 	}
 
+	elb, err := awsServices.LoadBalancing(regionName)
+	if err != nil {
+		return nil, fmt.Errorf("error creating AWS ELB client: %v", err)
+	}
+
 	asg, err := awsServices.Autoscaling(regionName)
 	if err != nil {
 		return nil, fmt.Errorf("error creating AWS autoscaling client: %v", err)
@@ -573,11 +561,11 @@ func newAWSCloud(config io.Reader, awsServices AWSServices) (*AWSCloud, error) {
 	awsCloud := &AWSCloud{
 		awsServices:      awsServices,
 		ec2:              ec2,
+		elb:              elb,
 		asg:              asg,
 		cfg:              cfg,
 		region:           regionName,
 		availabilityZone: zone,
-		elbClients:       map[string]ELB{},
 	}
 
 	filterTags := map[string]string{}
@@ -1239,16 +1227,11 @@ func (v *AWSCloud) Release(name string) error {
 }
 
 // Gets the current load balancer state
-func (s *AWSCloud) describeLoadBalancer(region, name string) (*elb.LoadBalancerDescription, error) {
-	elbClient, err := s.getELBClient(region)
-	if err != nil {
-		return nil, err
-	}
-
+func (s *AWSCloud) describeLoadBalancer(name string) (*elb.LoadBalancerDescription, error) {
 	request := &elb.DescribeLoadBalancersInput{}
 	request.LoadBalancerNames = []*string{&name}
 
-	response, err := elbClient.DescribeLoadBalancers(request)
+	response, err := s.elb.DescribeLoadBalancers(request)
 	if err != nil {
 		if awsError, ok := err.(awserr.Error); ok {
 			if awsError.Code() == "LoadBalancerNotFound" {
@@ -1268,25 +1251,41 @@ func (s *AWSCloud) describeLoadBalancer(region, name string) (*elb.LoadBalancerD
 	return ret, nil
 }
 
-// TCPLoadBalancerExists implements TCPLoadBalancer.TCPLoadBalancerExists.
-func (self *AWSCloud) TCPLoadBalancerExists(name, region string) (bool, error) {
-	lb, err := self.describeLoadBalancer(name, region)
+// Retrieves instance's vpc id from metadata
+func (self *AWSCloud) findVPCID() (string, error) {
+
+	metadata := self.awsServices.Metadata()
+	macsBytes, err := metadata.GetMetaData("network/interfaces/macs/")
 	if err != nil {
-		return false, err
+		return "", fmt.Errorf("Could not list interfaces of the instance", err)
 	}
 
-	if lb != nil {
-		return true, nil
+	// loop over interfaces, first vpc id returned wins
+	for _, macPath := range strings.Split(string(macsBytes), "\n") {
+
+		if len(macPath) == 0 {
+			continue
+		}
+		url := fmt.Sprintf("network/interfaces/macs/%svpc-id", macPath)
+		vpcIDBytes, err := metadata.GetMetaData(url)
+		if err != nil {
+			continue
+		}
+		return string(vpcIDBytes), nil
 	}
-	return false, nil
+	return "", fmt.Errorf("Could not find VPC id in instance metadata")
 }
 
 // Find the kubernetes VPC
 func (self *AWSCloud) findVPC() (*ec2.VPC, error) {
 	request := &ec2.DescribeVPCsInput{}
 
-	name := "kubernetes-vpc"
-	filters := []*ec2.Filter{newEc2Filter("tag:Name", name)}
+	// find by vpcID from metadata
+	vpcID, err := self.findVPCID()
+	if err != nil {
+		return nil, err
+	}
+	filters := []*ec2.Filter{newEc2Filter("vpc-id", vpcID)}
 	request.Filters = self.addFilters(filters)
 
 	vpcs, err := self.ec2.DescribeVPCs(request)
@@ -1301,7 +1300,7 @@ func (self *AWSCloud) findVPC() (*ec2.VPC, error) {
 	if len(vpcs) == 1 {
 		return vpcs[0], nil
 	}
-	return nil, fmt.Errorf("Found multiple matching VPCs for name: %s", name)
+	return nil, fmt.Errorf("Found multiple matching VPCs for vpcID = %s", vpcID)
 }
 
 // Retrieves the specified security group from the AWS API, or returns nil if not found
@@ -1383,7 +1382,7 @@ func isEqualIPPermission(l, r *ec2.IPPermission, compareGroupUserIDs bool) bool 
 }
 
 // Makes sure the security group includes the specified permissions
-// Returns true iff changes were made
+// Returns true if and only if changes were made
 // The security group must already exist
 func (s *AWSCloud) ensureSecurityGroupIngress(securityGroupId string, addPermissions []*ec2.IPPermission) (bool, error) {
 	group, err := s.findSecurityGroup(securityGroupId)
@@ -1437,7 +1436,7 @@ func (s *AWSCloud) ensureSecurityGroupIngress(securityGroupId string, addPermiss
 }
 
 // Makes sure the security group no longer includes the specified permissions
-// Returns true iff changes were made
+// Returns true if and only if changes were made
 // If the security group no longer exists, will return (false, nil)
 func (s *AWSCloud) removeSecurityGroupIngress(securityGroupId string, removePermissions []*ec2.IPPermission) (bool, error) {
 	group, err := s.findSecurityGroup(securityGroupId)
@@ -1596,9 +1595,8 @@ func (s *AWSCloud) createTags(request *ec2.CreateTagsInput) (*ec2.CreateTagsOutp
 func (s *AWSCloud) EnsureTCPLoadBalancer(name, region string, publicIP net.IP, ports []*api.ServicePort, hosts []string, affinity api.ServiceAffinity) (*api.LoadBalancerStatus, error) {
 	glog.V(2).Infof("EnsureTCPLoadBalancer(%v, %v, %v, %v, %v)", name, region, publicIP, ports, hosts)
 
-	elbClient, err := s.getELBClient(region)
-	if err != nil {
-		return nil, err
+	if region != s.region {
+		return nil, fmt.Errorf("requested load balancer region '%s' does not match cluster region '%s'", region, s.region)
 	}
 
 	if affinity != api.ServiceAffinityNone {
@@ -1703,12 +1701,12 @@ func (s *AWSCloud) EnsureTCPLoadBalancer(name, region string, publicIP net.IP, p
 	}
 
 	// Build the load balancer itself
-	loadBalancer, err := s.ensureLoadBalancer(region, name, listeners, subnetIDs, securityGroupIDs)
+	loadBalancer, err := s.ensureLoadBalancer(name, listeners, subnetIDs, securityGroupIDs)
 	if err != nil {
 		return nil, err
 	}
 
-	err = s.ensureLoadBalancerHealthCheck(region, loadBalancer, listeners)
+	err = s.ensureLoadBalancerHealthCheck(loadBalancer, listeners)
 	if err != nil {
 		return nil, err
 	}
@@ -1719,7 +1717,7 @@ func (s *AWSCloud) EnsureTCPLoadBalancer(name, region string, publicIP net.IP, p
 		return nil, err
 	}
 
-	err = s.ensureLoadBalancerInstances(elbClient, orEmpty(loadBalancer.LoadBalancerName), loadBalancer.Instances, instances)
+	err = s.ensureLoadBalancerInstances(orEmpty(loadBalancer.LoadBalancerName), loadBalancer.Instances, instances)
 	if err != nil {
 		glog.Warning("Error registering instances with the load balancer: %v", err)
 		return nil, err
@@ -1735,7 +1733,11 @@ func (s *AWSCloud) EnsureTCPLoadBalancer(name, region string, publicIP net.IP, p
 
 // GetTCPLoadBalancer is an implementation of TCPLoadBalancer.GetTCPLoadBalancer
 func (s *AWSCloud) GetTCPLoadBalancer(name, region string) (*api.LoadBalancerStatus, bool, error) {
-	lb, err := s.describeLoadBalancer(region, name)
+	if region != s.region {
+		return nil, false, fmt.Errorf("requested load balancer region '%s' does not match cluster region '%s'", region, s.region)
+	}
+
+	lb, err := s.describeLoadBalancer(name)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1895,12 +1897,11 @@ func (s *AWSCloud) updateInstanceSecurityGroupsForLoadBalancer(lb *elb.LoadBalan
 
 // EnsureTCPLoadBalancerDeleted implements TCPLoadBalancer.EnsureTCPLoadBalancerDeleted.
 func (s *AWSCloud) EnsureTCPLoadBalancerDeleted(name, region string) error {
-	elbClient, err := s.getELBClient(region)
-	if err != nil {
-		return err
+	if region != s.region {
+		return fmt.Errorf("requested load balancer region '%s' does not match cluster region '%s'", region, s.region)
 	}
 
-	lb, err := s.describeLoadBalancer(region, name)
+	lb, err := s.describeLoadBalancer(name)
 	if err != nil {
 		return err
 	}
@@ -1924,7 +1925,7 @@ func (s *AWSCloud) EnsureTCPLoadBalancerDeleted(name, region string) error {
 		request := &elb.DeleteLoadBalancerInput{}
 		request.LoadBalancerName = lb.LoadBalancerName
 
-		_, err = elbClient.DeleteLoadBalancer(request)
+		_, err = s.elb.DeleteLoadBalancer(request)
 		if err != nil {
 			// TODO: Check if error was because load balancer was concurrently deleted
 			glog.Error("error deleting load balancer: ", err)
@@ -1990,17 +1991,16 @@ func (s *AWSCloud) EnsureTCPLoadBalancerDeleted(name, region string) error {
 
 // UpdateTCPLoadBalancer implements TCPLoadBalancer.UpdateTCPLoadBalancer
 func (s *AWSCloud) UpdateTCPLoadBalancer(name, region string, hosts []string) error {
+	if region != s.region {
+		return fmt.Errorf("requested load balancer region '%s' does not match cluster region '%s'", region, s.region)
+	}
+
 	instances, err := s.getInstancesByNodeNames(hosts)
 	if err != nil {
 		return err
 	}
 
-	elbClient, err := s.getELBClient(region)
-	if err != nil {
-		return err
-	}
-
-	lb, err := s.describeLoadBalancer(region, name)
+	lb, err := s.describeLoadBalancer(name)
 	if err != nil {
 		return err
 	}
@@ -2009,7 +2009,7 @@ func (s *AWSCloud) UpdateTCPLoadBalancer(name, region string, hosts []string) er
 		return fmt.Errorf("Load balancer not found")
 	}
 
-	err = s.ensureLoadBalancerInstances(elbClient, orEmpty(lb.LoadBalancerName), lb.Instances, instances)
+	err = s.ensureLoadBalancerInstances(orEmpty(lb.LoadBalancerName), lb.Instances, instances)
 	if err != nil {
 		return nil
 	}

@@ -36,7 +36,11 @@ import (
 	cadvisorApi "github.com/google/cadvisor/info/v1"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/kubernetes/pkg/api"
+	apierrs "k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/api/latest"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/api/v1"
+	"k8s.io/kubernetes/pkg/api/validation"
 	"k8s.io/kubernetes/pkg/healthz"
 	"k8s.io/kubernetes/pkg/httplog"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
@@ -44,6 +48,7 @@ import (
 	"k8s.io/kubernetes/pkg/util/flushwriter"
 	"k8s.io/kubernetes/pkg/util/httpstream"
 	"k8s.io/kubernetes/pkg/util/httpstream/spdy"
+	"k8s.io/kubernetes/pkg/util/limitwriter"
 )
 
 // Server is a http.Handler which exposes kubelet functionality over HTTP.
@@ -102,7 +107,7 @@ type HostInterface interface {
 	RunInContainer(name string, uid types.UID, container string, cmd []string) ([]byte, error)
 	ExecInContainer(name string, uid types.UID, container string, cmd []string, in io.Reader, out, err io.WriteCloser, tty bool) error
 	AttachContainer(name string, uid types.UID, container string, in io.Reader, out, err io.WriteCloser, tty bool) error
-	GetKubeletContainerLogs(podFullName, containerName, tail string, follow, previous bool, stdout, stderr io.Writer) error
+	GetKubeletContainerLogs(podFullName, containerName string, logOptions *api.PodLogOptions, stdout, stderr io.Writer) error
 	ServeLogs(w http.ResponseWriter, req *http.Request)
 	PortForward(name string, uid types.UID, port uint16, stream io.ReadWriteCloser) error
 	StreamingConnectionIdleTimeout() time.Duration
@@ -130,7 +135,6 @@ func (s *Server) InstallDefaultHandlers() {
 	healthz.InstallHandler(s.restfulCont,
 		healthz.PingHealthz,
 		healthz.NamedCheck("docker", s.dockerHealthCheck),
-		healthz.NamedCheck("hostname", s.hostnameHealthCheck),
 		healthz.NamedCheck("syncloop", s.syncLoopHealthCheck),
 	)
 	var ws *restful.WebService
@@ -287,25 +291,6 @@ func (s *Server) dockerHealthCheck(req *http.Request) error {
 	return nil
 }
 
-func (s *Server) hostnameHealthCheck(req *http.Request) error {
-	masterHostname, _, err := net.SplitHostPort(req.Host)
-	if err != nil {
-		if !strings.Contains(req.Host, ":") {
-			masterHostname = req.Host
-		} else {
-			return fmt.Errorf("Could not parse hostname from http request: %v", err)
-		}
-	}
-
-	// Check that the hostname known by the master matches the hostname
-	// the kubelet knows
-	hostname := s.host.GetHostname()
-	if masterHostname != hostname && masterHostname != "127.0.0.1" && masterHostname != "localhost" {
-		return fmt.Errorf("Kubelet hostname \"%v\" does not match the hostname expected by the master \"%v\"", hostname, masterHostname)
-	}
-	return nil
-}
-
 // Checks if kubelet's sync loop  that updates containers is working.
 func (s *Server) syncLoopHealthCheck(req *http.Request) error {
 	duration := s.host.ResyncInterval() * 2
@@ -328,6 +313,7 @@ func (s *Server) getContainerLogs(request *restful.Request, response *restful.Re
 
 	if len(podID) == 0 {
 		// TODO: Why return JSON when the rest return plaintext errors?
+		// TODO: Why return plaintext errors?
 		response.WriteError(http.StatusBadRequest, fmt.Errorf(`{"message": "Missing podID."}`))
 		return
 	}
@@ -342,9 +328,32 @@ func (s *Server) getContainerLogs(request *restful.Request, response *restful.Re
 		return
 	}
 
-	follow, _ := strconv.ParseBool(request.QueryParameter("follow"))
-	previous, _ := strconv.ParseBool(request.QueryParameter("previous"))
-	tail := request.QueryParameter("tail")
+	query := request.Request.URL.Query()
+	// backwards compatibility for the "tail" query parameter
+	if tail := request.QueryParameter("tail"); len(tail) > 0 {
+		query["tailLines"] = []string{tail}
+		// "all" is the same as omitting tail
+		if tail == "all" {
+			delete(query, "tailLines")
+		}
+	}
+	// container logs on the kubelet are locked to v1
+	versioned := &v1.PodLogOptions{}
+	if err := api.Scheme.Convert(&query, versioned); err != nil {
+		response.WriteError(http.StatusBadRequest, fmt.Errorf(`{"message": "Unable to decode query."}`))
+		return
+	}
+	out, err := api.Scheme.ConvertToVersion(versioned, "")
+	if err != nil {
+		response.WriteError(http.StatusBadRequest, fmt.Errorf(`{"message": "Unable to convert request query."}`))
+		return
+	}
+	logOptions := out.(*api.PodLogOptions)
+	logOptions.TypeMeta = unversioned.TypeMeta{}
+	if errs := validation.ValidatePodLogOptions(logOptions); len(errs) > 0 {
+		response.WriteError(apierrs.StatusUnprocessableEntity, fmt.Errorf(`{"message": "Invalid request."}`))
+		return
+	}
 
 	pod, ok := s.host.GetPodByName(podNamespace, podID)
 	if !ok {
@@ -367,12 +376,16 @@ func (s *Server) getContainerLogs(request *restful.Request, response *restful.Re
 		response.WriteError(http.StatusInternalServerError, fmt.Errorf("unable to convert %v into http.Flusher", response))
 		return
 	}
-	fw := flushwriter.Wrap(response)
+	fw := flushwriter.Wrap(response.ResponseWriter)
+	if logOptions.LimitBytes != nil {
+		fw = limitwriter.New(fw, *logOptions.LimitBytes)
+	}
 	response.Header().Set("Transfer-Encoding", "chunked")
 	response.WriteHeader(http.StatusOK)
-	err := s.host.GetKubeletContainerLogs(kubecontainer.GetPodFullName(pod), containerName, tail, follow, previous, fw, fw)
-	if err != nil {
-		response.WriteError(http.StatusInternalServerError, err)
+	if err := s.host.GetKubeletContainerLogs(kubecontainer.GetPodFullName(pod), containerName, logOptions, fw, fw); err != nil {
+		if err != limitwriter.ErrMaximumWrite {
+			response.WriteError(http.StatusInternalServerError, err)
+		}
 		return
 	}
 }
@@ -384,7 +397,7 @@ func encodePods(pods []*api.Pod) (data []byte, err error) {
 	for _, pod := range pods {
 		podList.Items = append(podList.Items, *pod)
 	}
-	return latest.Codec.Encode(podList)
+	return latest.GroupOrDie("").Codec.Encode(podList)
 }
 
 // getPods returns a list of pods bound to the Kubelet and their spec.
@@ -563,7 +576,6 @@ WaitForStreams:
 			switch streamType {
 			case api.StreamTypeError:
 				errorStream = stream
-				defer errorStream.Reset()
 				receivedStreams++
 			case api.StreamTypeStdin:
 				stdinStream = stream
@@ -586,11 +598,6 @@ WaitForStreams:
 			glog.Error("Timed out waiting for client to create streams")
 			return nil, nil, nil, nil, nil, false, false
 		}
-	}
-
-	if stdinStream != nil {
-		// close our half of the input stream, since we won't be writing to it
-		stdinStream.Close()
 	}
 
 	return stdinStream, stdoutStream, stderrStream, errorStream, conn, tty, true

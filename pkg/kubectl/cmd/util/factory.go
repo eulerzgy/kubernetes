@@ -17,17 +17,21 @@ limitations under the License.
 package util
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
+	"path"
 	"strconv"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
 	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/latest"
 	"k8s.io/kubernetes/pkg/api/meta"
 	"k8s.io/kubernetes/pkg/api/registered"
 	"k8s.io/kubernetes/pkg/api/validation"
@@ -57,8 +61,6 @@ type Factory struct {
 	Object func() (meta.RESTMapper, runtime.ObjectTyper)
 	// Returns a client for accessing Kubernetes resources or an error.
 	Client func() (*client.Client, error)
-	// Returns a client for accessing experimental Kubernetes resources or an error.
-	ExperimentalClient func() (*client.ExperimentalClient, error)
 	// Returns a client.Config for accessing the Kubernetes server.
 	ClientConfig func() (*client.Config, error)
 	// Returns a RESTClient for working with the specified RESTMapping or an error. This is intended
@@ -79,13 +81,15 @@ type Factory struct {
 	// LabelsForObject returns the labels associated with the provided object
 	LabelsForObject func(object runtime.Object) (map[string]string, error)
 	// Returns a schema that can validate objects stored on disk.
-	Validator func(validate bool) (validation.Schema, error)
+	Validator func(validate bool, cacheDir string) (validation.Schema, error)
 	// Returns the default namespace to use in cases where no
 	// other namespace is specified and whether the namespace was
 	// overriden.
 	DefaultNamespace func() (string, bool, error)
 	// Returns the generator for the provided generator name
 	Generator func(name string) (kubectl.Generator, bool)
+	// Check whether the kind of resources could be exposed
+	CanBeExposed func(kind string) error
 }
 
 // NewFactory creates a factory with the default Kubernetes resources defined
@@ -110,28 +114,7 @@ func NewFactory(optionalClientConfig clientcmd.ClientConfig) *Factory {
 	}
 
 	clients := NewClientCache(clientConfig)
-	expClients := NewExperimentalClientCache(clientConfig)
 
-	noClientErr := errors.New("could not get client")
-	getBothClients := func(group string, version string) (*client.Client, *client.ExperimentalClient, error) {
-		switch group {
-		case "api":
-			client, err := clients.ClientForVersion(version)
-			return client, nil, err
-
-		case "experimental":
-			client, err := clients.ClientForVersion(version)
-			if err != nil {
-				return nil, nil, err
-			}
-			expClient, err := expClients.Client()
-			if err != nil {
-				return nil, nil, err
-			}
-			return client, expClient, err
-		}
-		return nil, nil, noClientErr
-	}
 	return &Factory{
 		clients:    clients,
 		flags:      flags,
@@ -147,30 +130,20 @@ func NewFactory(optionalClientConfig clientcmd.ClientConfig) *Factory {
 		Client: func() (*client.Client, error) {
 			return clients.ClientForVersion("")
 		},
-		ExperimentalClient: func() (*client.ExperimentalClient, error) {
-			return expClients.Client()
-		},
 		ClientConfig: func() (*client.Config, error) {
 			return clients.ClientConfigForVersion("")
 		},
 		RESTClient: func(mapping *meta.RESTMapping) (resource.RESTClient, error) {
 			group, err := api.RESTMapper.GroupForResource(mapping.Resource)
+			client, err := clients.ClientForVersion(mapping.APIVersion)
 			if err != nil {
 				return nil, err
 			}
 			switch group {
 			case "api":
-				client, err := clients.ClientForVersion(mapping.APIVersion)
-				if err != nil {
-					return nil, err
-				}
 				return client.RESTClient, nil
 			case "experimental":
-				client, err := expClients.Client()
-				if err != nil {
-					return nil, err
-				}
-				return client.RESTClient, nil
+				return client.ExperimentalClient.RESTClient, nil
 			}
 			return nil, fmt.Errorf("unable to get RESTClient for resource '%s'", mapping.Resource)
 		},
@@ -179,11 +152,11 @@ func NewFactory(optionalClientConfig clientcmd.ClientConfig) *Factory {
 			if err != nil {
 				return nil, err
 			}
-			client, expClient, err := getBothClients(group, mapping.APIVersion)
+			client, err := clients.ClientForVersion(mapping.APIVersion)
 			if err != nil {
 				return nil, err
 			}
-			if describer, ok := kubectl.DescriberFor(mapping.Kind, client, expClient); ok {
+			if describer, ok := kubectl.DescriberFor(group, mapping.Kind, client); ok {
 				return describer, nil
 			}
 			return nil, fmt.Errorf("no description has been implemented for %q", mapping.Kind)
@@ -235,35 +208,38 @@ func NewFactory(optionalClientConfig clientcmd.ClientConfig) *Factory {
 			return meta.NewAccessor().Labels(object)
 		},
 		Scaler: func(mapping *meta.RESTMapping) (kubectl.Scaler, error) {
-			group, err := api.RESTMapper.GroupForResource(mapping.Resource)
-			if err != nil {
-				return nil, err
-			}
-			client, _, err := getBothClients(group, mapping.APIVersion)
+			client, err := clients.ClientForVersion(mapping.APIVersion)
 			if err != nil {
 				return nil, err
 			}
 			return kubectl.ScalerFor(mapping.Kind, kubectl.NewScalerClient(client))
 		},
 		Reaper: func(mapping *meta.RESTMapping) (kubectl.Reaper, error) {
-			group, err := api.RESTMapper.GroupForResource(mapping.Resource)
+			client, err := clients.ClientForVersion(mapping.APIVersion)
 			if err != nil {
 				return nil, err
 			}
-			client, expClient, err := getBothClients(group, mapping.APIVersion)
-			if err != nil {
-				return nil, err
-			}
-			return kubectl.ReaperFor(mapping.Kind, client, expClient)
+			return kubectl.ReaperFor(mapping.Kind, client)
 		},
-		Validator: func(validate bool) (validation.Schema, error) {
+		Validator: func(validate bool, cacheDir string) (validation.Schema, error) {
 			if validate {
 				client, err := clients.ClientForVersion("")
 				if err != nil {
 					return nil, err
 				}
-				expClient, _ := expClients.Client()
-				return &clientSwaggerSchema{client, expClient, api.Scheme}, nil
+				dir := cacheDir
+				if len(dir) > 0 {
+					version, err := client.ServerVersion()
+					if err != nil {
+						return nil, err
+					}
+					dir = path.Join(cacheDir, version.String())
+				}
+				return &clientSwaggerSchema{
+					c:        client,
+					cacheDir: dir,
+					mapper:   api.RESTMapper,
+				}, nil
 			}
 			return validation.NullSchema{}, nil
 		},
@@ -273,6 +249,12 @@ func NewFactory(optionalClientConfig clientcmd.ClientConfig) *Factory {
 		Generator: func(name string) (kubectl.Generator, bool) {
 			generator, ok := generators[name]
 			return generator, ok
+		},
+		CanBeExposed: func(kind string) error {
+			if kind != "ReplicationController" && kind != "Service" && kind != "Pod" {
+				return fmt.Errorf("invalid resource provided: %v, only a replication controller, service or pod is accepted", kind)
+			}
+			return nil
 		},
 	}
 }
@@ -316,18 +298,49 @@ func getServicePorts(spec api.ServiceSpec) []string {
 }
 
 type clientSwaggerSchema struct {
-	c  *client.Client
-	ec *client.ExperimentalClient
-	t  runtime.ObjectTyper
+	c        *client.Client
+	cacheDir string
+	mapper   meta.RESTMapper
 }
 
-func getSchemaAndValidate(c *client.RESTClient, data []byte, group, version string) error {
-	schemaData, err := c.Get().
-		AbsPath("/swaggerapi", group, version).
-		Do().
-		Raw()
-	if err != nil {
-		return err
+const schemaFileName = "schema.json"
+
+type schemaClient interface {
+	Get() *client.Request
+}
+
+func getSchemaAndValidate(c schemaClient, data []byte, group, version, cacheDir string) (err error) {
+	var schemaData []byte
+	cacheFile := path.Join(cacheDir, group, version, schemaFileName)
+
+	if len(cacheDir) != 0 {
+		if schemaData, err = ioutil.ReadFile(cacheFile); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if schemaData == nil {
+		schemaData, err = c.Get().
+			AbsPath("/swaggerapi", group, version).
+			Do().
+			Raw()
+		if err != nil {
+			return err
+		}
+		if len(cacheDir) != 0 {
+			if err = os.MkdirAll(path.Join(cacheDir, group, version), 0755); err != nil {
+				return err
+			}
+			tmpFile, err := ioutil.TempFile(cacheDir, "schema")
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(tmpFile, bytes.NewBuffer(schemaData)); err != nil {
+				return err
+			}
+			if err := os.Link(tmpFile.Name(), cacheFile); err != nil && !os.IsExist(err) {
+				return err
+			}
+		}
 	}
 	schema, err := validation.NewSwaggerSchemaFromBytes(schemaData)
 	if err != nil {
@@ -337,25 +350,29 @@ func getSchemaAndValidate(c *client.RESTClient, data []byte, group, version stri
 }
 
 func (c *clientSwaggerSchema) ValidateBytes(data []byte) error {
-	version, _, err := runtime.UnstructuredJSONScheme.DataVersionAndKind(data)
+	version, kind, err := runtime.UnstructuredJSONScheme.DataVersionAndKind(data)
 	if err != nil {
 		return err
 	}
 	if ok := registered.IsRegisteredAPIVersion(version); !ok {
 		return fmt.Errorf("API version %q isn't supported, only supports API versions %q", version, registered.RegisteredVersions)
 	}
-	// First try stable api, if we can't validate using that, try experimental.
-	// If experimental fails, return error from stable api.
-	// TODO: Figure out which group to try once multiple group support is merged
-	//       instead of trying everything.
-	err = getSchemaAndValidate(c.c.RESTClient, data, "api", version)
-	if err != nil && c.ec != nil {
-		errExp := getSchemaAndValidate(c.ec.RESTClient, data, "experimental", version)
-		if errExp == nil {
-			return nil
-		}
+	resource, _ := meta.KindToResource(kind, false)
+	group, err := c.mapper.GroupForResource(resource)
+	if err != nil {
+		return fmt.Errorf("could not find api group for %s: %v", kind, err)
 	}
-	return err
+	if group == "experimental" {
+		g, err := latest.Group(group)
+		if err != nil {
+			return err
+		}
+		if c.c.ExperimentalClient == nil {
+			return errors.New("unable to validate: no experimental client")
+		}
+		return getSchemaAndValidate(c.c.ExperimentalClient.RESTClient, data, "apis/"+g.Group, version, c.cacheDir)
+	}
+	return getSchemaAndValidate(c.c.RESTClient, data, "api", version, c.cacheDir)
 }
 
 // DefaultClientConfig creates a clientcmd.ClientConfig with the following hierarchy:
