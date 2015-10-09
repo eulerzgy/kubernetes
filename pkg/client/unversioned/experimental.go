@@ -22,7 +22,7 @@ import (
 	"strings"
 
 	"k8s.io/kubernetes/pkg/api"
-	explatest "k8s.io/kubernetes/pkg/expapi/latest"
+	"k8s.io/kubernetes/pkg/api/latest"
 	"k8s.io/kubernetes/pkg/version"
 )
 
@@ -34,6 +34,10 @@ type ExperimentalInterface interface {
 	VersionInterface
 	HorizontalPodAutoscalersNamespacer
 	ScaleNamespacer
+	DaemonSetsNamespacer
+	DeploymentsNamespacer
+	JobsNamespacer
+	IngressNamespacer
 }
 
 // ExperimentalClient is used to interact with experimental Kubernetes features.
@@ -80,6 +84,22 @@ func (c *ExperimentalClient) Scales(namespace string) ScaleInterface {
 	return newScales(c, namespace)
 }
 
+func (c *ExperimentalClient) DaemonSets(namespace string) DaemonSetInterface {
+	return newDaemonSets(c, namespace)
+}
+
+func (c *ExperimentalClient) Deployments(namespace string) DeploymentInterface {
+	return newDeployments(c, namespace)
+}
+
+func (c *ExperimentalClient) Jobs(namespace string) JobInterface {
+	return newJobs(c, namespace)
+}
+
+func (c *ExperimentalClient) Ingress(namespace string) IngressInterface {
+	return newIngress(c, namespace)
+}
+
 // NewExperimental creates a new ExperimentalClient for the given config. This client
 // provides access to experimental Kubernetes features.
 // Experimental features are not supported and may be changed or removed in
@@ -109,23 +129,26 @@ func NewExperimentalOrDie(c *Config) *ExperimentalClient {
 }
 
 func setExperimentalDefaults(config *Config) error {
-	if config.Prefix == "" {
-		config.Prefix = "/experimental"
+	// if experimental group is not registered, return an error
+	g, err := latest.Group("experimental")
+	if err != nil {
+		return err
 	}
+	config.Prefix = "apis/"
 	if config.UserAgent == "" {
 		config.UserAgent = DefaultKubernetesUserAgent()
 	}
-	if config.Version == "" {
-		config.Version = explatest.Version
-	}
-	versionInterfaces, err := explatest.InterfacesFor(config.Version)
+	// TODO: Unconditionally set the config.Version, until we fix the config.
+	//if config.Version == "" {
+	config.Version = g.GroupVersion
+	//}
+
+	versionInterfaces, err := g.InterfacesFor(config.Version)
 	if err != nil {
 		return fmt.Errorf("Experimental API version '%s' is not recognized (valid values: %s)",
-			config.Version, strings.Join(explatest.Versions, ", "))
+			config.Version, strings.Join(latest.GroupOrDie("experimental").Versions, ", "))
 	}
-	if config.Codec == nil {
-		config.Codec = versionInterfaces.Codec
-	}
+	config.Codec = versionInterfaces.Codec
 	if config.QPS == 0 {
 		config.QPS = 5
 	}

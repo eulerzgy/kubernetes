@@ -26,6 +26,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/emicklei/go-restful/swagger"
+
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/testapi"
 	"k8s.io/kubernetes/pkg/fields"
@@ -54,7 +56,6 @@ type Response struct {
 
 type testClient struct {
 	*Client
-	*ExperimentalClient
 	Request  testRequest
 	Response Response
 	Error    bool
@@ -69,28 +70,29 @@ type testClient struct {
 	QueryValidator map[string]func(string, string) bool
 }
 
-func (c *testClient) Setup() *testClient {
+func (c *testClient) Setup(t *testing.T) *testClient {
 	c.handler = &util.FakeHandler{
 		StatusCode: c.Response.StatusCode,
 	}
-	if responseBody := body(c.Response.Body, c.Response.RawBody); responseBody != nil {
+	if responseBody := body(t, c.Response.Body, c.Response.RawBody); responseBody != nil {
 		c.handler.ResponseBody = *responseBody
 	}
 	c.server = httptest.NewServer(c.handler)
 	if c.Client == nil {
 		version := c.Version
 		if len(version) == 0 {
-			version = testapi.Version()
+			version = testapi.Default.Version()
 		}
 		c.Client = NewOrDie(&Config{
 			Host:    c.server.URL,
 			Version: version,
 		})
-	}
-	if c.ExperimentalClient == nil {
-		version := c.Version
+
+		// TODO: caesarxuchao: hacky way to specify version of Experimental client.
+		// We will fix this by supporting multiple group versions in Config
+		version = c.Version
 		if len(version) == 0 {
-			version = testapi.Version()
+			version = testapi.Experimental.Version()
 		}
 		c.ExperimentalClient = NewExperimentalOrDie(&Config{
 			Host:    c.server.URL,
@@ -135,7 +137,7 @@ func (c *testClient) ValidateCommon(t *testing.T, err error) {
 		return
 	}
 
-	requestBody := body(c.Request.Body, c.Request.RawBody)
+	requestBody := body(t, c.Request.Body, c.Request.RawBody)
 	actualQuery := c.handler.RequestReceived.URL.Query()
 	t.Logf("got query: %v", actualQuery)
 	t.Logf("path: %v", c.Request.Path)
@@ -147,9 +149,9 @@ func (c *testClient) ValidateCommon(t *testing.T, err error) {
 		validator, ok := c.QueryValidator[key]
 		if !ok {
 			switch key {
-			case api.LabelSelectorQueryParam(testapi.Version()):
+			case api.LabelSelectorQueryParam(testapi.Default.Version()):
 				validator = validateLabels
-			case api.FieldSelectorQueryParam(testapi.Version()):
+			case api.FieldSelectorQueryParam(testapi.Default.Version()):
 				validator = validateFields
 			default:
 				validator = func(a, b string) bool { return a == b }
@@ -211,9 +213,30 @@ func validateFields(a, b string) bool {
 	return sA.String() == sB.String()
 }
 
-func body(obj runtime.Object, raw *string) *string {
+func body(t *testing.T, obj runtime.Object, raw *string) *string {
 	if obj != nil {
-		bs, _ := testapi.Codec().Encode(obj)
+		_, kind, err := api.Scheme.ObjectVersionAndKind(obj)
+		if err != nil {
+			t.Errorf("unexpected encoding error: %v", err)
+		}
+		// TODO: caesarxuchao: we should detect which group an object belongs to
+		// by using the version returned by Schem.ObjectVersionAndKind() once we
+		// split the schemes for internal objects.
+		// TODO: caesarxuchao: we should add a map from kind to group in Scheme.
+		var bs []byte
+		if api.Scheme.Recognizes(testapi.Default.GroupAndVersion(), kind) {
+			bs, err = testapi.Default.Codec().Encode(obj)
+			if err != nil {
+				t.Errorf("unexpected encoding error: %v", err)
+			}
+		} else if api.Scheme.Recognizes(testapi.Experimental.GroupAndVersion(), kind) {
+			bs, err = testapi.Experimental.Codec().Encode(obj)
+			if err != nil {
+				t.Errorf("unexpected encoding error: %v", err)
+			}
+		} else {
+			t.Errorf("unexpected kind: %v", kind)
+		}
 		body := string(bs)
 		return &body
 	}
@@ -267,5 +290,65 @@ func TestGetServerAPIVersions(t *testing.T) {
 	}
 	if e, a := expect, *got; !reflect.DeepEqual(e, a) {
 		t.Errorf("expected %v, got %v", e, a)
+	}
+}
+
+func swaggerSchemaFakeServer() (*httptest.Server, error) {
+	request := 1
+	var sErr error
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var resp interface{}
+		if request == 1 {
+			resp = api.APIVersions{Versions: []string{"v1", "v2", "v3"}}
+			request++
+		} else {
+			resp = swagger.ApiDeclaration{}
+		}
+		output, err := json.Marshal(resp)
+		if err != nil {
+			sErr = err
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(output)
+	}))
+	return server, sErr
+}
+
+func TestGetSwaggerSchema(t *testing.T) {
+	expect := swagger.ApiDeclaration{}
+
+	server, err := swaggerSchemaFakeServer()
+	if err != nil {
+		t.Errorf("unexpected encoding error: %v", err)
+	}
+
+	client := NewOrDie(&Config{Host: server.URL})
+	got, err := client.SwaggerSchema("v1")
+	if err != nil {
+		t.Fatalf("unexpected encoding error: %v", err)
+	}
+	if e, a := expect, *got; !reflect.DeepEqual(e, a) {
+		t.Errorf("expected %v, got %v", e, a)
+	}
+}
+
+func TestGetSwaggerSchemaFail(t *testing.T) {
+	expErr := "API version: v4 is not supported by the server. Use one of: [v1 v2 v3]"
+
+	server, err := swaggerSchemaFakeServer()
+	if err != nil {
+		t.Errorf("unexpected encoding error: %v", err)
+	}
+
+	client := NewOrDie(&Config{Host: server.URL})
+	got, err := client.SwaggerSchema("v4")
+	if got != nil {
+		t.Fatalf("unexpected response: %v", got)
+	}
+	if err.Error() != expErr {
+		t.Errorf("expected an error, got %v", err)
 	}
 }

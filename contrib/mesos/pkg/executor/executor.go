@@ -33,19 +33,23 @@ import (
 	mutil "github.com/mesos/mesos-go/mesosutil"
 	"k8s.io/kubernetes/contrib/mesos/pkg/archive"
 	"k8s.io/kubernetes/contrib/mesos/pkg/executor/messages"
+	"k8s.io/kubernetes/contrib/mesos/pkg/node"
 	"k8s.io/kubernetes/contrib/mesos/pkg/scheduler/meta"
 	"k8s.io/kubernetes/pkg/api"
+	unversionedapi "k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/client/cache"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
+	"k8s.io/kubernetes/pkg/controller/framework"
 	"k8s.io/kubernetes/pkg/kubelet"
 	"k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/dockertools"
+	kubeletTypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/util"
-	"k8s.io/kubernetes/pkg/watch"
 )
 
 const (
 	containerPollTime = 1 * time.Second
-	launchGracePeriod = 5 * time.Minute
+	podRelistPeriod   = 5 * time.Minute
 )
 
 type stateType int32
@@ -88,15 +92,6 @@ type kuberTask struct {
 	podName       string
 }
 
-// func that attempts suicide
-type jumper func(bindings.ExecutorDriver, <-chan struct{})
-
-type suicideWatcher interface {
-	Next(time.Duration, bindings.ExecutorDriver, jumper) suicideWatcher
-	Reset(time.Duration) bool
-	Stop() bool
-}
-
 type podStatusFunc func() (*api.PodStatus, error)
 
 // KubeletInterface consists of the kubelet.Kubelet API's that we actually use
@@ -115,7 +110,6 @@ type KubernetesExecutor struct {
 	lock                 sync.RWMutex
 	sourcename           string
 	client               *client.Client
-	events               <-chan watch.Event
 	done                 chan struct{}                     // signals shutdown
 	outgoing             chan func() (mesos.Status, error) // outgoing queue to the mesos driver
 	dockerClient         dockertools.DockerInterface
@@ -129,6 +123,8 @@ type KubernetesExecutor struct {
 	staticPodsConfig     []byte
 	staticPodsConfigPath string
 	initialRegComplete   chan struct{}
+	podController        *framework.Controller
+	launchGracePeriod    time.Duration
 }
 
 type Config struct {
@@ -136,7 +132,6 @@ type Config struct {
 	Updates              chan<- interface{} // to send pod config updates to the kubelet
 	SourceName           string
 	APIClient            *client.Client
-	Watch                watch.Interface
 	Docker               dockertools.DockerInterface
 	ShutdownAlert        func()
 	SuicideTimeout       time.Duration
@@ -144,6 +139,8 @@ type Config struct {
 	ExitFunc             func(int)
 	PodStatusFunc        func(KubeletInterface, *api.Pod) (*api.PodStatus, error)
 	StaticPodsConfigPath string
+	PodLW                cache.ListerWatcher
+	LaunchGracePeriod    time.Duration
 }
 
 func (k *KubernetesExecutor) isConnected() bool {
@@ -171,26 +168,35 @@ func New(config Config) *KubernetesExecutor {
 		podStatusFunc:        config.PodStatusFunc,
 		initialRegComplete:   make(chan struct{}),
 		staticPodsConfigPath: config.StaticPodsConfigPath,
+		launchGracePeriod:    config.LaunchGracePeriod,
 	}
-	//TODO(jdef) do something real with these events..
-	if config.Watch != nil {
-		events := config.Watch.ResultChan()
-		if events != nil {
-			go func() {
-				for e := range events {
-					// e ~= watch.Event { ADDED, *api.Event }
-					log.V(1).Info(e)
-				}
-			}()
-			k.events = events
-		}
-	}
+
+	// watch pods from the given pod ListWatch
+	_, k.podController = framework.NewInformer(config.PodLW, &api.Pod{}, podRelistPeriod, &framework.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			pod := obj.(*api.Pod)
+			log.V(4).Infof("pod %s/%s created on apiserver", pod.Namespace, pod.Name)
+			k.handleChangedApiserverPod(pod)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			pod := newObj.(*api.Pod)
+			log.V(4).Infof("pod %s/%s updated on apiserver", pod.Namespace, pod.Name)
+			k.handleChangedApiserverPod(pod)
+		},
+		DeleteFunc: func(obj interface{}) {
+			pod := obj.(*api.Pod)
+			log.V(4).Infof("pod %s/%s deleted on apiserver", pod.Namespace, pod.Name)
+		},
+	})
+
 	return k
 }
 
 func (k *KubernetesExecutor) Init(driver bindings.ExecutorDriver) {
 	k.killKubeletContainers()
 	k.resetSuicideWatch(driver)
+
+	go k.podController.Run(k.done)
 	go k.sendLoop()
 	//TODO(jdef) monitor kubeletFinished and shutdown if it happens
 }
@@ -224,6 +230,13 @@ func (k *KubernetesExecutor) Registered(driver bindings.ExecutorDriver,
 		k.staticPodsConfig = executorInfo.Data
 	}
 
+	if slaveInfo != nil {
+		_, err := node.CreateOrUpdate(k.client, slaveInfo.GetHostname(), node.SlaveAttributesToLabels(slaveInfo.Attributes))
+		if err != nil {
+			log.Errorf("cannot update node labels: %v", err)
+		}
+	}
+
 	k.initialRegistration.Do(k.onInitialRegistration)
 }
 
@@ -238,15 +251,23 @@ func (k *KubernetesExecutor) Reregistered(driver bindings.ExecutorDriver, slaveI
 		log.Errorf("failed to reregister/transition to a connected state")
 	}
 
+	if slaveInfo != nil {
+		_, err := node.CreateOrUpdate(k.client, slaveInfo.GetHostname(), node.SlaveAttributesToLabels(slaveInfo.Attributes))
+		if err != nil {
+			log.Errorf("cannot update node labels: %v", err)
+		}
+	}
+
 	k.initialRegistration.Do(k.onInitialRegistration)
 }
 
 func (k *KubernetesExecutor) onInitialRegistration() {
 	defer close(k.initialRegComplete)
+
 	// emit an empty update to allow the mesos "source" to be marked as seen
-	k.updateChan <- kubelet.PodUpdate{
+	k.updateChan <- kubeletTypes.PodUpdate{
 		Pods:   []*api.Pod{},
-		Op:     kubelet.SET,
+		Op:     kubeletTypes.SET,
 		Source: k.sourcename,
 	}
 }
@@ -338,36 +359,47 @@ func (k *KubernetesExecutor) LaunchTask(driver bindings.ExecutorDriver, taskInfo
 	go k.launchTask(driver, taskId, pod)
 }
 
-// TODO(jdef) add metrics for this?
-type suicideTimer struct {
-	timer *time.Timer
-}
-
-func (w *suicideTimer) Next(d time.Duration, driver bindings.ExecutorDriver, f jumper) suicideWatcher {
-	return &suicideTimer{
-		timer: time.AfterFunc(d, func() {
-			log.Warningf("Suicide timeout (%v) expired", d)
-			f(driver, nil)
-		}),
+func (k *KubernetesExecutor) handleChangedApiserverPod(pod *api.Pod) {
+	// exclude "pre-scheduled" pods which have a NodeName set to this node without being scheduled already
+	taskId := pod.Annotations[meta.TaskIdKey]
+	if taskId == "" {
+		log.V(5).Infof("ignoring pod update for %s/%s because %s annotation is missing", pod.Namespace, pod.Name, meta.TaskIdKey)
+		return
 	}
-}
 
-func (w *suicideTimer) Stop() (result bool) {
-	if w != nil && w.timer != nil {
-		log.Infoln("stopping suicide watch") //TODO(jdef) debug
-		result = w.timer.Stop()
-	}
-	return
-}
+	k.lock.Lock()
+	defer k.lock.Unlock()
 
-// return true if the timer was successfully reset
-func (w *suicideTimer) Reset(d time.Duration) bool {
-	if w != nil && w.timer != nil {
-		log.Infoln("resetting suicide watch") //TODO(jdef) debug
-		w.timer.Reset(d)
-		return true
+	// exclude tasks which are already deleted from our task registry
+	task := k.tasks[taskId]
+	if task == nil {
+		log.Warningf("task %s for pod %s/%s not found", taskId, pod.Namespace, pod.Name)
+		return
 	}
-	return false
+
+	oldPod := k.pods[task.podName]
+
+	// terminating pod?
+	if oldPod != nil && pod.Status.Phase == api.PodRunning {
+		timeModified := differentTime(oldPod.DeletionTimestamp, pod.DeletionTimestamp)
+		graceModified := differentPeriod(oldPod.DeletionGracePeriodSeconds, pod.DeletionGracePeriodSeconds)
+		if timeModified || graceModified {
+			log.Infof("pod %s/%s is terminating at %v with %vs grace period, telling kubelet", pod.Namespace, pod.Name, *pod.DeletionTimestamp, *pod.DeletionGracePeriodSeconds)
+
+			// modify the pod in our registry instead of sending the new pod. The later
+			// would allow that other changes bleed into the kubelet. For now we are
+			// very conservative changing this behaviour.
+			// TODO(sttts): check whether we can and should send all changes down to the kubelet
+			oldPod.DeletionTimestamp = pod.DeletionTimestamp
+			oldPod.DeletionGracePeriodSeconds = pod.DeletionGracePeriodSeconds
+
+			update := kubeletTypes.PodUpdate{
+				Op:   kubeletTypes.UPDATE,
+				Pods: []*api.Pod{oldPod},
+			}
+			k.updateChan <- update
+		}
+	}
 }
 
 // determine whether we need to start a suicide countdown. if so, then start
@@ -533,11 +565,10 @@ func (k *KubernetesExecutor) launchTask(driver bindings.ExecutorDriver, taskId s
 	task.podName = podFullName
 	k.pods[podFullName] = pod
 
-	// send the latest snapshot of the set of pods to the kubelet via the pod update channel.
-	// this results in the kubelet spinning up the new pod.
-	update := kubelet.PodUpdate{Op: kubelet.SET}
-	for _, p := range k.pods {
-		update.Pods = append(update.Pods, p)
+	// send the new pod to the kubelet which will spin it up
+	update := kubeletTypes.PodUpdate{
+		Op:   kubeletTypes.ADD,
+		Pods: []*api.Pod{pod},
 	}
 	k.updateChan <- update
 
@@ -571,7 +602,10 @@ func (k *KubernetesExecutor) launchTask(driver bindings.ExecutorDriver, taskId s
 func (k *KubernetesExecutor) _launchTask(driver bindings.ExecutorDriver, taskId, podFullName string, psf podStatusFunc) {
 
 	expired := make(chan struct{})
-	time.AfterFunc(launchGracePeriod, func() { close(expired) })
+
+	if k.launchGracePeriod > 0 {
+		time.AfterFunc(k.launchGracePeriod, func() { close(expired) })
+	}
 
 	getMarshalledInfo := func() (data []byte, cancel bool) {
 		// potentially long call..
@@ -610,7 +644,7 @@ waitForRunningPod:
 	for {
 		select {
 		case <-expired:
-			log.Warningf("Launch expired grace period of '%v'", launchGracePeriod)
+			log.Warningf("Launch expired grace period of '%v'", k.launchGracePeriod)
 			break waitForRunningPod
 		case <-time.After(containerPollTime):
 			if data, cancel := getMarshalledInfo(); cancel {
@@ -729,16 +763,17 @@ func (k *KubernetesExecutor) removePodTask(driver bindings.ExecutorDriver, tid, 
 	k.resetSuicideWatch(driver)
 
 	pid := task.podName
-	if _, found := k.pods[pid]; !found {
+	pod, found := k.pods[pid]
+	if !found {
 		log.Warningf("Cannot remove unknown pod %v for task %v", pid, tid)
 	} else {
 		log.V(2).Infof("deleting pod %v for task %v", pid, tid)
 		delete(k.pods, pid)
 
-		// Send the pod updates to the channel.
-		update := kubelet.PodUpdate{Op: kubelet.SET}
-		for _, p := range k.pods {
-			update.Pods = append(update.Pods, p)
+		// tell the kubelet to remove the pod
+		update := kubeletTypes.PodUpdate{
+			Op:   kubeletTypes.REMOVE,
+			Pods: []*api.Pod{pod},
 		}
 		k.updateChan <- update
 	}
@@ -758,8 +793,8 @@ func (k *KubernetesExecutor) FrameworkMessage(driver bindings.ExecutorDriver, me
 
 	log.Infof("Receives message from framework %v\n", message)
 	//TODO(jdef) master reported a lost task, reconcile this! @see scheduler.go:handleTaskLost
-	if strings.HasPrefix(message, "task-lost:") && len(message) > 10 {
-		taskId := message[10:]
+	if strings.HasPrefix(message, messages.TaskLost+":") {
+		taskId := message[len(messages.TaskLost)+1:]
 		if taskId != "" {
 			// clean up pod state
 			k.lock.Lock()
@@ -915,4 +950,12 @@ func (k *KubernetesExecutor) sendLoop() {
 			}
 		}
 	}
+}
+
+func differentTime(a, b *unversionedapi.Time) bool {
+	return (a == nil) != (b == nil) || (a != nil && b != nil && *a != *b)
+}
+
+func differentPeriod(a, b *int64) bool {
+	return (a == nil) != (b == nil) || (a != nil && b != nil && *a != *b)
 }

@@ -101,7 +101,8 @@ API changes for request
 - Add validation code that checks request <= limit, and validation test cases (api/validation/validation.go)
 
 Scheduler Changes
-- Use requests instead of limits in CheckPodsExceedingCapacity and PodFitsResources (scheduler/algorithm/predicates.go)
+- Predicates: Use requests instead of limits in CheckPodsExceedingCapacity and PodFitsResources (scheduler/algorithm/predicates/predicates.go)
+- Priorities: Use requests instead of limits in LeastRequestedPriority and BalancedResourceAllocation(scheduler/algorithm/priorities/priorities.go)(PR #12718)
 
 Container Manager Changes
 - Use requests to assign CPU shares for Docker (kubelet/dockertools/container_manager.go)
@@ -148,7 +149,7 @@ Container OOM score configuration
   - Hack, because these critical tasks might die if they conflict with guaranteed containers. in the future, we should place all user-pods into a separate cgroup, and set a limit on the memory they can consume.
 
 Setting OOM_SCORE_ADJ for a container
-- Refactor existing ApplyOomScoreAdj to util/oom.go
+- Refactor existing ApplyOOMScoreAdj to util/oom.go
 - To set OOM_SCORE_ADJ of a container, we loop through all processes in the container, and set OOM_SCORE_ADJ
 - We keep looping until the list of processes in the container stabilizes. This is sufficient because child processes inherit OOM_SCORE_ADJ.
 

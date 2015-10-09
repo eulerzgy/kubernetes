@@ -212,7 +212,7 @@ A Kubernetes binary release includes all the Kubernetes binaries as well as the 
 You can use a Kubernetes binary release (recommended) or build your Kubernetes binaries following the instructions in the
 [Developer Documentation](../devel/README.md).  Only using a binary release is covered in this guide.
 
-Download the [latest binary release](https://github.com/GoogleCloudPlatform/kubernetes/releases/latest) and unzip it.
+Download the [latest binary release](https://github.com/kubernetes/kubernetes/releases/latest) and unzip it.
 Then locate `./kubernetes/server/kubernetes-server-linux-amd64.tar.gz` and unzip *that*.
 Then, within the second set of unzipped files, locate `./kubernetes/server/bin`, which contains
 all the necessary binaries.
@@ -226,7 +226,7 @@ we recommend that you run these as containers, so you need an image to be built.
 You have several choices for Kubernetes images:
 - Use images hosted on Google Container Registry (GCR):
   - e.g `gcr.io/google_containers/hyperkube:$TAG`, where `TAG` is the latest
-    release tag, which can be found on the [latest releases page](https://github.com/GoogleCloudPlatform/kubernetes/releases/latest).
+    release tag, which can be found on the [latest releases page](https://github.com/kubernetes/kubernetes/releases/latest).
   - Ensure $TAG is the same tag as the release tag you are using for kubelet and kube-proxy.
   - The [hyperkube](../../cmd/hyperkube/) binary is an all in one binary
     - `hyperkube kubelet ...` runs the kublet, `hyperkube apiserver ...` runs an apiserver, etc.
@@ -240,7 +240,7 @@ You have several choices for Kubernetes images:
 
 For etcd, you can:
 - Use images hosted on Google Container Registry (GCR), such as `gcr.io/google_containers/etcd:2.0.12`
-- Use images hosted on [Docker Hub](https://registry.hub.docker.com/u/coreos/etcd/) or [quay.io](https://registry.hub.docker.com/u/coreos/etcd/)
+- Use images hosted on [Docker Hub](https://hub.docker.com/search/?q=etcd) or [Quay.io](https://quay.io/repository/coreos/etcd), such as `quay.io/coreos/etcd:v2.2.0`
 - Use etcd binary included in your OS distro.
 - Build your own image
   - You can do: `cd kubernetes/cluster/images/etcd; make`
@@ -476,7 +476,7 @@ because of how this is used later.
   1. Set appropriate MTU
   - `ip link set dev cbr0 mtu 1460` (NOTE: the actual value of MTU will depend on your network environment)
   1. Add the clusters network to the bridge (docker will go on other side of bridge).
-  - e.g. `ip addr add $NODE_X_BRIDGE_ADDR dev eth0`
+  - e.g. `ip addr add $NODE_X_BRIDGE_ADDR dev cbr0`
   1. Turn it on
   - e.g. `ip link set dev cbr0 up`
 
@@ -485,7 +485,7 @@ other, then you may need to do masquerading just for destination IPs outside
 the cluster network.  For example:
 
 ```sh
-iptables -w -t nat -A POSTROUTING -o eth0 -j MASQUERADE \! -d ${CLUSTER_SUBNET}
+iptables -t nat -A POSTROUTING ! -d ${CLUSTER_SUBNET} -m addrtype ! --dst-type LOCAL -j MASQUERADE
 ```
 
 This will rewrite the source address from
@@ -535,6 +535,7 @@ You will need to run one or more instances of etcd.
 availability.
 
 To run an etcd instance:
+
 1. copy `cluster/saltbase/salt/etcd/etcd.manifest`
 1. make any modifications needed
 1. start the pod by putting it into the kubelet manifest directory
@@ -709,6 +710,7 @@ Complete this template for the scheduler pod:
         ],
         "livenessProbe": {
           "httpGet": {
+            "host" : "127.0.0.1",
             "path": "/healthz",
             "port": 10251
           },
@@ -765,6 +767,7 @@ Template for controller manager pod:
         ],
         "livenessProbe": {
           "httpGet": {
+            "host": "127.0.0.1",
             "path": "/healthz",
             "port": 10252
           },
@@ -830,7 +833,7 @@ $ curl -s http://localhost:8080/api
 ```
 
 If you have selected the `--register-node=true` option for kubelets, they will now begin self-registering with the apiserver.
-You should soon be able to see all your nodes by running the `kubect get nodes` command.
+You should soon be able to see all your nodes by running the `kubectl get nodes` command.
 Otherwise, you will need to manually create node objects.
 
 ### Logging
@@ -839,7 +842,7 @@ Otherwise, you will need to manually create node objects.
 
 ### Monitoring
 
-**TODO** talk about starting Logging.
+**TODO** talk about starting Monitoring.
 
 ### DNS
 
@@ -872,7 +875,7 @@ pinging or SSH-ing from one node to another.
 ### Getting Help
 
 If you run into trouble, please see the section on [troubleshooting](gce.md#troubleshooting), post to the
-[google-containers group](https://groups.google.com/forum/#!forum/google-containers), or come ask questions on IRC at [#google-containers](http://webchat.freenode.net/?channels=google-containers) on freenode.
+[google-containers group](https://groups.google.com/forum/#!forum/google-containers), or come ask questions on [Slack](../troubleshooting.md#slack).
 
 
 <!-- BEGIN MUNGE: GENERATED_ANALYTICS -->

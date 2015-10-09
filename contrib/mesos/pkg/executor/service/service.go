@@ -18,12 +18,10 @@ package service
 
 import (
 	"fmt"
-	"io"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -32,64 +30,46 @@ import (
 
 	log "github.com/golang/glog"
 	bindings "github.com/mesos/mesos-go/executor"
+	"github.com/spf13/pflag"
 	"k8s.io/kubernetes/cmd/kubelet/app"
 	"k8s.io/kubernetes/contrib/mesos/pkg/executor"
 	"k8s.io/kubernetes/contrib/mesos/pkg/executor/config"
 	"k8s.io/kubernetes/contrib/mesos/pkg/hyperkube"
-	"k8s.io/kubernetes/contrib/mesos/pkg/redirfd"
 	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/client/cache"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/credentialprovider"
+	"k8s.io/kubernetes/pkg/fields"
 	"k8s.io/kubernetes/pkg/healthz"
 	"k8s.io/kubernetes/pkg/kubelet"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	kconfig "k8s.io/kubernetes/pkg/kubelet/config"
+	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/dockertools"
+	kubeletTypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/util"
+	utilio "k8s.io/kubernetes/pkg/util/io"
 	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/util/oom"
-
-	"github.com/spf13/pflag"
 )
 
 const (
 	// if we don't use this source then the kubelet will do funny, mirror things.
 	// @see ConfigSourceAnnotationKey
-	MESOS_CFG_SOURCE = kubelet.ApiserverSource
+	MESOS_CFG_SOURCE = kubeletTypes.ApiserverSource
 )
 
 type KubeletExecutorServer struct {
 	*app.KubeletServer
-	SuicideTimeout time.Duration
-	ShutdownFD     int
-	ShutdownFIFO   string
-	cgroupRoot     string
-	cgroupPrefix   string
-}
-
-func findMesosCgroup(prefix string) string {
-	// derive our cgroup from MESOS_DIRECTORY environment
-	mesosDir := os.Getenv("MESOS_DIRECTORY")
-	if mesosDir == "" {
-		log.V(2).Infof("cannot derive executor's cgroup because MESOS_DIRECTORY is empty")
-		return ""
-	}
-
-	containerId := path.Base(mesosDir)
-	if containerId == "" {
-		log.V(2).Infof("cannot derive executor's cgroup from MESOS_DIRECTORY=%q", mesosDir)
-		return ""
-	}
-	trimmedPrefix := strings.Trim(prefix, "/")
-	cgroupRoot := fmt.Sprintf("/%s/%v", trimmedPrefix, containerId)
-	return cgroupRoot
+	SuicideTimeout    time.Duration
+	LaunchGracePeriod time.Duration
 }
 
 func NewKubeletExecutorServer() *KubeletExecutorServer {
 	k := &KubeletExecutorServer{
-		KubeletServer:  app.NewKubeletServer(),
-		SuicideTimeout: config.DefaultSuicideTimeout,
-		cgroupPrefix:   config.DefaultCgroupPrefix,
+		KubeletServer:     app.NewKubeletServer(),
+		SuicideTimeout:    config.DefaultSuicideTimeout,
+		LaunchGracePeriod: config.DefaultLaunchGracePeriod,
 	}
 	if pwd, err := os.Getwd(); err != nil {
 		log.Warningf("failed to determine current directory: %v", err)
@@ -97,7 +77,6 @@ func NewKubeletExecutorServer() *KubeletExecutorServer {
 		k.RootDirectory = pwd // mesos sandbox dir
 	}
 	k.Address = net.ParseIP(defaultBindingAddress())
-	k.ShutdownFD = -1 // indicates unspecified FD
 
 	return k
 }
@@ -105,46 +84,22 @@ func NewKubeletExecutorServer() *KubeletExecutorServer {
 func (s *KubeletExecutorServer) AddFlags(fs *pflag.FlagSet) {
 	s.KubeletServer.AddFlags(fs)
 	fs.DurationVar(&s.SuicideTimeout, "suicide-timeout", s.SuicideTimeout, "Self-terminate after this period of inactivity. Zero disables suicide watch.")
-	fs.IntVar(&s.ShutdownFD, "shutdown-fd", s.ShutdownFD, "File descriptor used to signal shutdown to external watchers, requires shutdown-fifo flag")
-	fs.StringVar(&s.ShutdownFIFO, "shutdown-fifo", s.ShutdownFIFO, "FIFO used to signal shutdown to external watchers, requires shutdown-fd flag")
-	fs.StringVar(&s.cgroupPrefix, "cgroup-prefix", s.cgroupPrefix, "The cgroup prefix concatenated with MESOS_DIRECTORY must give the executor cgroup set by Mesos")
-}
-
-// returns a Closer that should be closed to signal impending shutdown, but only if ShutdownFD
-// and ShutdownFIFO were specified. if they are specified, then this func blocks until there's
-// a reader on the FIFO stream.
-func (s *KubeletExecutorServer) syncExternalShutdownWatcher() (io.Closer, error) {
-	if s.ShutdownFD == -1 || s.ShutdownFIFO == "" {
-		return nil, nil
-	}
-	// redirfd -w n fifo ...  # (blocks until the fifo is read)
-	log.Infof("blocked, waiting for shutdown reader for FD %d FIFO at %s", s.ShutdownFD, s.ShutdownFIFO)
-	return redirfd.Write.Redirect(true, false, redirfd.FileDescriptor(s.ShutdownFD), s.ShutdownFIFO)
+	fs.DurationVar(&s.LaunchGracePeriod, "mesos-launch-grace-period", s.LaunchGracePeriod, "Launch grace period after which launching tasks will be cancelled. Zero disables launch cancellation.")
 }
 
 // Run runs the specified KubeletExecutorServer.
 func (s *KubeletExecutorServer) Run(hks hyperkube.Interface, _ []string) error {
 	rand.Seed(time.Now().UTC().UnixNano())
 
-	oomAdjuster := oom.NewOomAdjuster()
-	if err := oomAdjuster.ApplyOomScoreAdj(0, s.OOMScoreAdj); err != nil {
+	oomAdjuster := oom.NewOOMAdjuster()
+	if err := oomAdjuster.ApplyOOMScoreAdj(0, s.OOMScoreAdj); err != nil {
 		log.Info(err)
 	}
-
-	// derive the executor cgroup and use it as docker container cgroup root
-	mesosCgroup := findMesosCgroup(s.cgroupPrefix)
-	s.cgroupRoot = mesosCgroup
-	log.V(2).Infof("passing cgroup %q to the kubelet as cgroup root", s.CgroupRoot)
 
 	// empty string for the docker and system containers (= cgroup paths). This
 	// stops the kubelet taking any control over other system processes.
 	s.SystemContainer = ""
 	s.DockerDaemonContainer = ""
-
-	// We set kubelet container to its own cgroup below the executor cgroup.
-	// In contrast to the docker and system container, this has no other
-	// undesired side-effects.
-	s.ResourceContainer = mesosCgroup + "/kubelet"
 
 	// create apiserver client
 	var apiclient *client.Client
@@ -161,12 +116,7 @@ func (s *KubeletExecutorServer) Run(hks hyperkube.Interface, _ []string) error {
 	log.Infof("Using root directory: %v", s.RootDirectory)
 	credentialprovider.SetPreferredDockercfgPath(s.RootDirectory)
 
-	shutdownCloser, err := s.syncExternalShutdownWatcher()
-	if err != nil {
-		return err
-	}
-
-	cadvisorInterface, err := cadvisor.New(s.CadvisorPort)
+	cAdvisorInterface, err := cadvisor.New(s.CAdvisorPort)
 	if err != nil {
 		return err
 	}
@@ -187,7 +137,17 @@ func (s *KubeletExecutorServer) Run(hks hyperkube.Interface, _ []string) error {
 	//cloud := cloudprovider.InitCloudProvider(s.CloudProvider, s.CloudConfigFile)
 	//log.Infof("Successfully initialized cloud provider: %q from the config file: %q\n", s.CloudProvider, s.CloudConfigFile)
 
-	hostNetworkSources, err := kubelet.GetValidatedSources(strings.Split(s.HostNetworkSources, ","))
+	hostNetworkSources, err := kubeletTypes.GetValidatedSources(strings.Split(s.HostNetworkSources, ","))
+	if err != nil {
+		return err
+	}
+
+	hostPIDSources, err := kubeletTypes.GetValidatedSources(strings.Split(s.HostPIDSources, ","))
+	if err != nil {
+		return err
+	}
+
+	hostIPCSources, err := kubeletTypes.GetValidatedSources(strings.Split(s.HostIPCSources, ","))
 	if err != nil {
 		return err
 	}
@@ -202,72 +162,97 @@ func (s *KubeletExecutorServer) Run(hks hyperkube.Interface, _ []string) error {
 		mounter = &mount.NsenterMounter{}
 	}
 
+	var writer utilio.Writer = &utilio.StdWriter{}
 	var dockerExecHandler dockertools.ExecHandler
 	switch s.DockerExecHandlerName {
 	case "native":
 		dockerExecHandler = &dockertools.NativeExecHandler{}
 	case "nsenter":
+		writer = &utilio.NsenterWriter{}
 		dockerExecHandler = &dockertools.NsenterExecHandler{}
 	default:
 		log.Warningf("Unknown Docker exec handler %q; defaulting to native", s.DockerExecHandlerName)
 		dockerExecHandler = &dockertools.NativeExecHandler{}
 	}
 
+	manifestURLHeader := make(http.Header)
+	if s.ManifestURLHeader != "" {
+		pieces := strings.Split(s.ManifestURLHeader, ":")
+		if len(pieces) != 2 {
+			return fmt.Errorf("manifest-url-header must have a single ':' key-value separator, got %q", s.ManifestURLHeader)
+		}
+		manifestURLHeader.Set(pieces[0], pieces[1])
+	}
+
 	kcfg := app.KubeletConfig{
-		Address:            s.Address,
-		AllowPrivileged:    s.AllowPrivileged,
-		HostNetworkSources: hostNetworkSources,
-		HostnameOverride:   s.HostnameOverride,
-		RootDirectory:      s.RootDirectory,
+		Address:           s.Address,
+		AllowPrivileged:   s.AllowPrivileged,
+		CAdvisorInterface: cAdvisorInterface,
+		CgroupRoot:        s.CgroupRoot,
+		Cloud:             nil, // TODO(jdef) Cloud, specifying null here because we don't want all kubelets polling mesos-master; need to account for this in the cloudprovider impl
+		ClusterDNS:        s.ClusterDNS,
+		ClusterDomain:     s.ClusterDomain,
 		// ConfigFile: ""
-		// ManifestURL: ""
-		FileCheckFrequency: s.FileCheckFrequency,
+		ConfigureCBR0:           s.ConfigureCBR0,
+		ContainerRuntime:        s.ContainerRuntime,
+		CPUCFSQuota:             s.CPUCFSQuota,
+		DiskSpacePolicy:         diskSpacePolicy,
+		DockerClient:            dockertools.ConnectToDockerOrDie(s.DockerEndpoint),
+		DockerDaemonContainer:   s.DockerDaemonContainer,
+		DockerExecHandler:       dockerExecHandler,
+		EnableDebuggingHandlers: s.EnableDebuggingHandlers,
+		EnableServer:            s.EnableServer,
+		EventBurst:              s.EventBurst,
+		EventRecordQPS:          s.EventRecordQPS,
+		FileCheckFrequency:      s.FileCheckFrequency,
+		HostnameOverride:        s.HostnameOverride,
+		HostNetworkSources:      hostNetworkSources,
+		HostPIDSources:          hostPIDSources,
+		HostIPCSources:          hostIPCSources,
 		// HTTPCheckFrequency
-		PodInfraContainerImage:  s.PodInfraContainerImage,
-		SyncFrequency:           s.SyncFrequency,
-		RegistryPullQPS:         s.RegistryPullQPS,
-		RegistryBurst:           s.RegistryBurst,
-		MinimumGCAge:            s.MinimumGCAge,
-		MaxPerPodContainerCount: s.MaxPerPodContainerCount,
-		MaxContainerCount:       s.MaxContainerCount,
-		RegisterNode:            s.RegisterNode,
-		// StandaloneMode: false
-		ClusterDomain:                  s.ClusterDomain,
-		ClusterDNS:                     s.ClusterDNS,
-		Runonce:                        s.RunOnce,
-		Port:                           s.Port,
-		ReadOnlyPort:                   s.ReadOnlyPort,
-		CadvisorInterface:              cadvisorInterface,
-		EnableServer:                   s.EnableServer,
-		EnableDebuggingHandlers:        s.EnableDebuggingHandlers,
-		DockerClient:                   dockertools.ConnectToDockerOrDie(s.DockerEndpoint),
-		KubeClient:                     apiclient,
-		MasterServiceNamespace:         s.MasterServiceNamespace,
-		VolumePlugins:                  app.ProbeVolumePlugins(),
-		NetworkPlugins:                 app.ProbeNetworkPlugins(s.NetworkPluginDir),
-		NetworkPluginName:              s.NetworkPluginName,
-		StreamingConnectionIdleTimeout: s.StreamingConnectionIdleTimeout,
-		TLSOptions:                     tlsOptions,
-		ImageGCPolicy:                  imageGCPolicy,
-		DiskSpacePolicy:                diskSpacePolicy,
-		Cloud:                          nil, // TODO(jdef) Cloud, specifying null here because we don't want all kubelets polling mesos-master; need to account for this in the cloudprovider impl
-		NodeStatusUpdateFrequency: s.NodeStatusUpdateFrequency,
-		ResourceContainer:         s.ResourceContainer,
-		CgroupRoot:                s.cgroupRoot,
-		ContainerRuntime:          s.ContainerRuntime,
-		Mounter:                   mounter,
-		DockerDaemonContainer:     s.DockerDaemonContainer,
-		SystemContainer:           s.SystemContainer,
-		ConfigureCBR0:             s.ConfigureCBR0,
+		ImageGCPolicy: imageGCPolicy,
+		KubeClient:    apiclient,
+		// ManifestURL: ""
+		ManifestURLHeader:         manifestURLHeader,
+		MasterServiceNamespace:    s.MasterServiceNamespace,
+		MaxContainerCount:         s.MaxContainerCount,
+		MaxOpenFiles:              s.MaxOpenFiles,
+		MaxPerPodContainerCount:   s.MaxPerPodContainerCount,
 		MaxPods:                   s.MaxPods,
-		DockerExecHandler:         dockerExecHandler,
+		MinimumGCAge:              s.MinimumGCAge,
+		Mounter:                   mounter,
+		NetworkPluginName:         s.NetworkPluginName,
+		NetworkPlugins:            app.ProbeNetworkPlugins(s.NetworkPluginDir),
+		NodeStatusUpdateFrequency: s.NodeStatusUpdateFrequency,
+		OOMAdjuster:               oomAdjuster,
+		OSInterface:               kubecontainer.RealOS{},
+		PodCIDR:                   s.PodCIDR,
+		PodInfraContainerImage:    s.PodInfraContainerImage,
+		Port:              s.Port,
+		ReadOnlyPort:      s.ReadOnlyPort,
+		RegisterNode:      s.RegisterNode,
+		RegistryBurst:     s.RegistryBurst,
+		RegistryPullQPS:   s.RegistryPullQPS,
+		ResolverConfig:    s.ResolverConfig,
+		ResourceContainer: s.ResourceContainer,
+		RootDirectory:     s.RootDirectory,
+		Runonce:           s.RunOnce,
+		// StandaloneMode: false
+		StreamingConnectionIdleTimeout: s.StreamingConnectionIdleTimeout,
+		SyncFrequency:                  s.SyncFrequency,
+		SystemContainer:                s.SystemContainer,
+		TLSOptions:                     tlsOptions,
+		VolumePlugins:                  app.ProbeVolumePlugins(),
+		Writer:                         writer,
 	}
 
 	kcfg.NodeName = kcfg.Hostname
 
-	err = app.RunKubelet(&kcfg, app.KubeletBuilder(func(kc *app.KubeletConfig) (app.KubeletBootstrap, *kconfig.PodConfig, error) {
-		return s.createAndInitKubelet(kc, hks, clientConfig, shutdownCloser)
-	}))
+	kcfg.Builder = app.KubeletBuilder(func(kc *app.KubeletConfig) (app.KubeletBootstrap, *kconfig.PodConfig, error) {
+		return s.createAndInitKubelet(kc, hks, clientConfig)
+	})
+
+	err = app.RunKubelet(&kcfg)
 	if err != nil {
 		return err
 	}
@@ -299,7 +284,6 @@ func (ks *KubeletExecutorServer) createAndInitKubelet(
 	kc *app.KubeletConfig,
 	hks hyperkube.Interface,
 	clientConfig *client.Config,
-	shutdownCloser io.Closer,
 ) (app.KubeletBootstrap, *kconfig.PodConfig, error) {
 
 	// TODO(k8s): block until all sources have delivered at least one update to the channel, or break the sync loop
@@ -314,13 +298,13 @@ func (ks *KubeletExecutorServer) createAndInitKubelet(
 		kubeClient = kc.KubeClient
 	}
 
-	gcPolicy := kubelet.ContainerGCPolicy{
+	gcPolicy := kubecontainer.ContainerGCPolicy{
 		MinAge:             kc.MinimumGCAge,
 		MaxPerPodContainer: kc.MaxPerPodContainerCount,
 		MaxContainers:      kc.MaxContainerCount,
 	}
 
-	pc := kconfig.NewPodConfig(kconfig.PodConfigNotificationSnapshotAndUpdates, kc.Recorder)
+	pc := kconfig.NewPodConfig(kconfig.PodConfigNotificationIncremental, kc.Recorder)
 	updates := pc.Channel(MESOS_CFG_SOURCE)
 
 	klet, err := kubelet.NewMainKubelet(
@@ -333,6 +317,8 @@ func (ks *KubeletExecutorServer) createAndInitKubelet(
 		kc.SyncFrequency,
 		float32(kc.RegistryPullQPS),
 		kc.RegistryBurst,
+		kc.EventRecordQPS,
+		kc.EventBurst,
 		gcPolicy,
 		pc.SeenAllSources,
 		kc.RegisterNode,
@@ -345,7 +331,7 @@ func (ks *KubeletExecutorServer) createAndInitKubelet(
 		kc.NetworkPluginName,
 		kc.StreamingConnectionIdleTimeout,
 		kc.Recorder,
-		kc.CadvisorInterface,
+		kc.CAdvisorInterface,
 		kc.ImageGCPolicy,
 		kc.DiskSpacePolicy,
 		kc.Cloud,
@@ -355,13 +341,21 @@ func (ks *KubeletExecutorServer) createAndInitKubelet(
 		kc.CgroupRoot,
 		kc.ContainerRuntime,
 		kc.RktPath,
+		kc.RktStage1Image,
 		kc.Mounter,
+		kc.Writer,
 		kc.DockerDaemonContainer,
 		kc.SystemContainer,
 		kc.ConfigureCBR0,
 		kc.PodCIDR,
 		kc.MaxPods,
 		kc.DockerExecHandler,
+		kc.ResolverConfig,
+		kc.CPUCFSQuota,
+		&api.NodeDaemonEndpoints{
+			KubeletEndpoint: api.DaemonEndpoint{Port: int(kc.Port)},
+		},
+		kc.OOMAdjuster,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -372,30 +366,25 @@ func (ks *KubeletExecutorServer) createAndInitKubelet(
 	kubeletFinished := make(chan struct{})
 	staticPodsConfigPath := filepath.Join(kc.RootDirectory, "static-pods")
 	exec := executor.New(executor.Config{
-		Kubelet:         klet,
-		Updates:         updates,
-		SourceName:      MESOS_CFG_SOURCE,
-		APIClient:       kc.KubeClient,
-		Docker:          kc.DockerClient,
-		SuicideTimeout:  ks.SuicideTimeout,
-		KubeletFinished: kubeletFinished,
-		ShutdownAlert: func() {
-			if shutdownCloser != nil {
-				if e := shutdownCloser.Close(); e != nil {
-					log.Warningf("failed to signal shutdown to external watcher: %v", e)
-				}
-			}
-		},
-		ExitFunc: os.Exit,
+		Kubelet:           klet,
+		Updates:           updates,
+		SourceName:        MESOS_CFG_SOURCE,
+		APIClient:         kc.KubeClient,
+		Docker:            kc.DockerClient,
+		SuicideTimeout:    ks.SuicideTimeout,
+		LaunchGracePeriod: ks.LaunchGracePeriod,
+		KubeletFinished:   kubeletFinished,
+		ExitFunc:          os.Exit,
 		PodStatusFunc: func(_ executor.KubeletInterface, pod *api.Pod) (*api.PodStatus, error) {
 			return klet.GetRuntime().GetPodStatus(pod)
 		},
 		StaticPodsConfigPath: staticPodsConfigPath,
+		PodLW:                cache.NewListWatchFromClient(kc.KubeClient, "pods", api.NamespaceAll, fields.OneTermEqualSelector(client.PodHost, kc.NodeName)),
 	})
 
 	go exec.InitializeStaticPodsSource(func() {
 		// Create file source only when we are called back. Otherwise, it is never marked unseen.
-		fileSourceUpdates := pc.Channel(kubelet.FileSource)
+		fileSourceUpdates := pc.Channel(kubeletTypes.FileSource)
 
 		kconfig.NewSourceFile(staticPodsConfigPath, kc.Hostname, kc.FileCheckFrequency, fileSourceUpdates)
 	})
@@ -461,7 +450,7 @@ func (kl *kubeletExecutor) ListenAndServe(address net.IP, port uint, tlsOptions 
 
 // runs the main kubelet loop, closing the kubeletFinished chan when the loop exits.
 // never returns.
-func (kl *kubeletExecutor) Run(updates <-chan kubelet.PodUpdate) {
+func (kl *kubeletExecutor) Run(updates <-chan kubeletTypes.PodUpdate) {
 	defer func() {
 		close(kl.kubeletFinished)
 		util.HandleCrash()
@@ -472,7 +461,7 @@ func (kl *kubeletExecutor) Run(updates <-chan kubelet.PodUpdate) {
 
 	// push updates through a closable pipe. when the executor indicates shutdown
 	// via Done() we want to stop the Kubelet from processing updates.
-	pipe := make(chan kubelet.PodUpdate)
+	pipe := make(chan kubeletTypes.PodUpdate)
 	go func() {
 		// closing pipe will cause our patched kubelet's syncLoop() to exit
 		defer close(pipe)

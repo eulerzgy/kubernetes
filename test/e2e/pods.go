@@ -35,7 +35,11 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func runLivenessTest(c *client.Client, ns string, podDescr *api.Pod, expectNumRestarts int) {
+const (
+	defaultObservationTimeout = time.Minute * 2
+)
+
+func runLivenessTest(c *client.Client, ns string, podDescr *api.Pod, expectNumRestarts int, timeout time.Duration) {
 	By(fmt.Sprintf("Creating pod %s in namespace %s", podDescr.Name, ns))
 	_, err := c.Pods(ns).Create(podDescr)
 	expectNoError(err, fmt.Sprintf("creating pod %s", podDescr.Name))
@@ -61,7 +65,7 @@ func runLivenessTest(c *client.Client, ns string, podDescr *api.Pod, expectNumRe
 	By(fmt.Sprintf("Initial restart count of pod %s is %d", podDescr.Name, initialRestartCount))
 
 	// Wait for the restart state to be as desired.
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(timeout)
 	lastRestartCount := initialRestartCount
 	observedRestarts := 0
 	for start := time.Now(); time.Now().Before(deadline); time.Sleep(2 * time.Second) {
@@ -255,7 +259,7 @@ var _ = Describe("Pods", func() {
 			Fail("Timeout while waiting for pod creation")
 		}
 
-		By("deleting the pod")
+		By("deleting the pod gracefully")
 		if err := podClient.Delete(pod.Name, nil); err != nil {
 			Failf("Failed to delete pod: %v", err)
 		}
@@ -263,11 +267,13 @@ var _ = Describe("Pods", func() {
 		By("verifying pod deletion was observed")
 		deleted := false
 		timeout := false
+		var lastPod *api.Pod
 		timer := time.After(podStartTimeout)
 		for !deleted && !timeout {
 			select {
 			case event, _ := <-w.ResultChan():
 				if event.Type == watch.Deleted {
+					lastPod = event.Object.(*api.Pod)
 					deleted = true
 				}
 			case <-timer:
@@ -277,6 +283,9 @@ var _ = Describe("Pods", func() {
 		if !deleted {
 			Fail("Failed to observe pod deletion")
 		}
+
+		Expect(lastPod.DeletionTimestamp).ToNot(BeNil())
+		Expect(lastPod.Spec.TerminationGracePeriodSeconds).ToNot(BeZero())
 
 		pods, err = podClient.List(labels.SelectorFromSet(labels.Set(map[string]string{"time": value})), fields.Everything())
 		if err != nil {
@@ -477,7 +486,7 @@ var _ = Describe("Pods", func() {
 					},
 				},
 			},
-		}, 1)
+		}, 1, defaultObservationTimeout)
 	})
 
 	It("should *not* be restarted with a docker exec \"cat /tmp/health\" liveness probe", func() {
@@ -503,7 +512,7 @@ var _ = Describe("Pods", func() {
 					},
 				},
 			},
-		}, 0)
+		}, 0, defaultObservationTimeout)
 	})
 
 	It("should be restarted with a /healthz http liveness probe", func() {
@@ -530,10 +539,10 @@ var _ = Describe("Pods", func() {
 					},
 				},
 			},
-		}, 1)
+		}, 1, defaultObservationTimeout)
 	})
 
-	PIt("should have monotonically increasing restart count", func() {
+	It("should have monotonically increasing restart count", func() {
 		runLivenessTest(framework.Client, framework.Namespace.Name, &api.Pod{
 			ObjectMeta: api.ObjectMeta{
 				Name:   "liveness-http",
@@ -557,7 +566,7 @@ var _ = Describe("Pods", func() {
 					},
 				},
 			},
-		}, 8)
+		}, 5, time.Minute*5)
 	})
 
 	It("should *not* be restarted with a /healthz http liveness probe", func() {
@@ -590,7 +599,7 @@ var _ = Describe("Pods", func() {
 					},
 				},
 			},
-		}, 0)
+		}, 0, defaultObservationTimeout)
 	})
 
 	// The following tests for remote command execution and port forwarding are
@@ -655,7 +664,7 @@ var _ = Describe("Pods", func() {
 				pod.Status.Host, pod.Name, pod.Spec.Containers[0].Name))
 			req := framework.Client.Get().
 				Prefix("proxy").
-				Resource("minions").
+				Resource("nodes").
 				Name(pod.Status.Host).
 				Suffix("exec", framework.Namespace.Name, pod.Name, pod.Spec.Containers[0].Name)
 
@@ -729,7 +738,7 @@ var _ = Describe("Pods", func() {
 
 			req := framework.Client.Get().
 				Prefix("proxy").
-				Resource("minions").
+				Resource("nodes").
 				Name(pod.Status.Host).
 				Suffix("portForward", framework.Namespace.Name, pod.Name)
 

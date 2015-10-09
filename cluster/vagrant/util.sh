@@ -34,6 +34,18 @@ function detect-minions {
 # Verify prereqs on host machine  Also sets exports USING_KUBE_SCRIPTS=true so
 # that our Vagrantfile doesn't error out.
 function verify-prereqs {
+  if [[ "${ENABLE_EXPERIMENTAL_API}" == "true" ]]; then
+    if [[ -z "${RUNTIME_CONFIG}" ]]; then
+      RUNTIME_CONFIG="experimental/v1alpha1"
+    else
+      # TODO: add checking if RUNTIME_CONFIG contains "experimental/v1=false" and appending "experimental/v1=true" if not.
+      if echo "${RUNTIME_CONFIG}" | grep -q -v "experimental/v1alpha1=true"; then
+        echo "Experimental API should be turned on, but is not turned on in RUNTIME_CONFIG!"
+        exit 1
+      fi
+    fi
+  fi
+  
   for x in vagrant; do
     if ! which "$x" >/dev/null; then
       echo "Can't find $x in PATH, please fix and retry."
@@ -148,12 +160,17 @@ function create-provision-scripts {
     echo "DNS_REPLICAS='${DNS_REPLICAS:-}'"
     echo "RUNTIME_CONFIG='${RUNTIME_CONFIG:-}'"
     echo "ADMISSION_CONTROL='${ADMISSION_CONTROL:-}'"
-    echo "DOCKER_OPTS='${EXTRA_DOCKER_OPTS-}'"
+    echo "DOCKER_OPTS='${EXTRA_DOCKER_OPTS:-}'"
     echo "VAGRANT_DEFAULT_PROVIDER='${VAGRANT_DEFAULT_PROVIDER:-}'"
     echo "KUBELET_TOKEN='${KUBELET_TOKEN:-}'"
     echo "KUBE_PROXY_TOKEN='${KUBE_PROXY_TOKEN:-}'"
     echo "MASTER_EXTRA_SANS='${MASTER_EXTRA_SANS:-}'"
-    awk '!/^#/' "${KUBE_ROOT}/cluster/vagrant/provision-network.sh"
+    echo "ENABLE_CPU_CFS_QUOTA='${ENABLE_CPU_CFS_QUOTA}'"
+    echo "NETWORK_PROVIDER='${NETWORK_PROVIDER:-}'"
+    echo "OPENCONTRAIL_TAG='${OPENCONTRAIL_TAG:-}'"
+    echo "OPENCONTRAIL_KUBERNETES_TAG='${OPENCONTRAIL_KUBERNETES_TAG:-}'"
+    echo "OPENCONTRAIL_PUBLIC_SUBNET='${OPENCONTRAIL_PUBLIC_SUBNET:-}'"
+    awk '!/^#/' "${KUBE_ROOT}/cluster/vagrant/provision-network-master.sh"
     awk '!/^#/' "${KUBE_ROOT}/cluster/vagrant/provision-master.sh"
   ) > "${KUBE_TEMP}/master-start.sh"
 
@@ -173,12 +190,12 @@ function create-provision-scripts {
       echo "CONTAINER_NETMASK='${MINION_CONTAINER_NETMASKS[$i]}'"
       echo "MINION_CONTAINER_SUBNETS=(${MINION_CONTAINER_SUBNETS[@]})"
       echo "CONTAINER_SUBNET='${CONTAINER_SUBNET}'"
-      echo "DOCKER_OPTS='${EXTRA_DOCKER_OPTS-}'"
+      echo "DOCKER_OPTS='${EXTRA_DOCKER_OPTS:-}'"
       echo "VAGRANT_DEFAULT_PROVIDER='${VAGRANT_DEFAULT_PROVIDER:-}'"
       echo "KUBELET_TOKEN='${KUBELET_TOKEN:-}'"
       echo "KUBE_PROXY_TOKEN='${KUBE_PROXY_TOKEN:-}'"
       echo "MASTER_EXTRA_SANS='${MASTER_EXTRA_SANS:-}'"
-      awk '!/^#/' "${KUBE_ROOT}/cluster/vagrant/provision-network.sh"
+      awk '!/^#/' "${KUBE_ROOT}/cluster/vagrant/provision-network-minion.sh"
       awk '!/^#/' "${KUBE_ROOT}/cluster/vagrant/provision-minion.sh"
     ) > "${KUBE_TEMP}/minion-start-${i}.sh"
   done
@@ -198,6 +215,9 @@ function verify-cluster {
   local machine="master"
   local -a required_daemon=("salt-master" "salt-minion" "kubelet")
   local validated="1"
+  # This is a hack, but sometimes the salt-minion gets stuck on the master, so we just restart it
+  # to ensure that users never wait forever
+  vagrant ssh "$machine" -c "sudo systemctl restart salt-minion"
   until [[ "$validated" == "0" ]]; do
     validated="0"
     local daemon
@@ -237,7 +257,7 @@ function verify-cluster {
     local count="0"
     until [[ "$count" == "1" ]]; do
       local minions
-      minions=$("${KUBE_ROOT}/cluster/kubectl.sh" get nodes -o template -t '{{range.items}}{{.metadata.name}}:{{end}}' --api-version=v1)
+      minions=$("${KUBE_ROOT}/cluster/kubectl.sh" get nodes -o go-template='{{range.items}}{{.metadata.name}}:{{end}}' --api-version=v1)
       count=$(echo $minions | grep -c "${MINION_IPS[i]}") || {
         printf "."
         sleep 2
@@ -256,13 +276,21 @@ function verify-cluster {
     # ensures KUBECONFIG is set
     get-kubeconfig-basicauth
     echo
-    echo "Kubernetes cluster is running.  The master is running at:"
+    echo "Kubernetes cluster is running."
+    echo
+    echo "The master is running at:"
     echo
     echo "  https://${MASTER_IP}"
     echo
+    echo "Administer and visualize its resources using Cockpit:"
+    echo
+    echo "  https://${MASTER_IP}:9090"
+    echo
+    echo "For more information on Cockpit, visit http://cockpit-project.org"
+    echo 
     echo "The user name and password to use is located in ${KUBECONFIG}"
     echo
-    )
+  )
 }
 
 # Instantiate a kubernetes cluster

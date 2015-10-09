@@ -111,7 +111,7 @@ func tryConnect(service proxy.ServicePortName, srcAddr net.Addr, protocol string
 
 func (tcp *tcpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *serviceInfo, proxier *Proxier) {
 	for {
-		if info, exists := proxier.getServiceInfo(service); !exists || info != myInfo {
+		if !myInfo.isAlive() {
 			// The service port was closed or replaced.
 			return
 		}
@@ -125,14 +125,14 @@ func (tcp *tcpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *serv
 			if isClosedError(err) {
 				return
 			}
-			if info, exists := proxier.getServiceInfo(service); !exists || info != myInfo {
+			if !myInfo.isAlive() {
 				// Then the service port was just closed so the accept failure is to be expected.
 				return
 			}
 			glog.Errorf("Accept failed: %v", err)
 			continue
 		}
-		glog.V(2).Infof("Accepted TCP connection from %v to %v", inConn.RemoteAddr(), inConn.LocalAddr())
+		glog.V(3).Infof("Accepted TCP connection from %v to %v", inConn.RemoteAddr(), inConn.LocalAddr())
 		outConn, err := tryConnect(service, inConn.(*net.TCPConn).RemoteAddr(), "tcp", proxier)
 		if err != nil {
 			glog.Errorf("Failed to connect to balancer: %v", err)
@@ -198,7 +198,7 @@ func newClientCache() *clientCache {
 func (udp *udpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *serviceInfo, proxier *Proxier) {
 	var buffer [4096]byte // 4KiB should be enough for most whole-packets
 	for {
-		if info, exists := proxier.getServiceInfo(service); !exists || info != myInfo {
+		if !myInfo.isAlive() {
 			// The service port was closed or replaced.
 			break
 		}
@@ -247,7 +247,7 @@ func (udp *udpProxySocket) getBackendConn(activeClients *clientCache, cliAddr ne
 	if !found {
 		// TODO: This could spin up a new goroutine to make the outbound connection,
 		// and keep accepting inbound traffic.
-		glog.V(2).Infof("New UDP connection from %s", cliAddr)
+		glog.V(3).Infof("New UDP connection from %s", cliAddr)
 		var err error
 		svrConn, err = tryConnect(service, cliAddr, "udp", proxier)
 		if err != nil {

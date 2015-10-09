@@ -74,8 +74,7 @@ function check-curl-proxy-code()
   echo "For address ${full_address}, got ${status} but wanted ${desired}"
   return 1
 }
-
-trap cleanup EXIT SIGINT
+kube::util::trap_add cleanup EXIT SIGINT
 
 kube::util::ensure-temp-dir
 kube::etcd::start
@@ -128,7 +127,7 @@ kube::util::wait_for_url "http://127.0.0.1:${KUBELET_HEALTHZ_PORT}/healthz" "kub
 
 # Start kube-apiserver
 kube::log::status "Starting kube-apiserver"
-KUBE_API_VERSIONS="v1" "${KUBE_OUTPUT_HOSTBIN}/kube-apiserver" \
+KUBE_API_VERSIONS="v1,experimental/v1alpha1" "${KUBE_OUTPUT_HOSTBIN}/kube-apiserver" \
   --address="127.0.0.1" \
   --public-address-override="127.0.0.1" \
   --port="${API_PORT}" \
@@ -163,17 +162,18 @@ runTests() {
       -s "http://127.0.0.1:${API_PORT}"
       --match-server-version
     )
-    [ "$(kubectl get nodes -t '{{ .apiVersion }}' "${kube_flags[@]}")" == "v1" ]
+    [ "$(kubectl get nodes -o go-template='{{ .apiVersion }}' "${kube_flags[@]}")" == "v1" ]
   else
     kube_flags=(
       -s "http://127.0.0.1:${API_PORT}"
       --match-server-version
       --api-version="${version}"
     )
-    [ "$(kubectl get nodes -t '{{ .apiVersion }}' "${kube_flags[@]}")" == "${version}" ]
+    [ "$(kubectl get nodes -o go-template='{{ .apiVersion }}' "${kube_flags[@]}")" == "${version}" ]
   fi
   id_field=".metadata.name"
   labels_field=".metadata.labels"
+  annotations_field=".metadata.annotations"
   service_selector_field=".spec.selector"
   rc_replicas_field=".spec.replicas"
   rc_status_replicas_field=".status.replicas"
@@ -390,6 +390,11 @@ runTests() {
   kubectl patch "${kube_flags[@]}" pod valid-pod -p='{"spec":{"containers":[{"name": "kubernetes-serve-hostname", "image": "nginx"}]}}'
   # Post-condition: valid-pod POD has image nginx
   kube::test::get_object_assert pods "{{range.items}}{{$image_field}}:{{end}}" 'nginx:'
+  # prove that yaml input works too
+  YAML_PATCH=$'spec:\n  containers:\n  - name: kubernetes-serve-hostname\n    image: changed-with-yaml\n'
+  kubectl patch "${kube_flags[@]}" pod valid-pod -p="${YAML_PATCH}"
+  # Post-condition: valid-pod POD has image nginx
+  kube::test::get_object_assert pods "{{range.items}}{{$image_field}}:{{end}}" 'changed-with-yaml:'
   ## Patch pod from JSON can change image
   # Command
   kubectl patch "${kube_flags[@]}" -f docs/admin/limitrange/valid-pod.yaml -p='{"spec":{"containers":[{"name": "kubernetes-serve-hostname", "image": "kubernetes/pause"}]}}'
@@ -398,11 +403,21 @@ runTests() {
 
   ## --force replace pod can change other field, e.g., spec.container.name
   # Command
-  kubectl get "${kube_flags[@]}" pod valid-pod -o json | sed 's/"kubernetes-serve-hostname"/"replaced-k8s-serve-hostname"/g' > tmp-valid-pod.json
-  kubectl replace "${kube_flags[@]}" --force -f tmp-valid-pod.json
+  kubectl get "${kube_flags[@]}" pod valid-pod -o json | sed 's/"kubernetes-serve-hostname"/"replaced-k8s-serve-hostname"/g' > /tmp/tmp-valid-pod.json
+  kubectl replace "${kube_flags[@]}" --force -f /tmp/tmp-valid-pod.json
   # Post-condition: spec.container.name = "replaced-k8s-serve-hostname"
   kube::test::get_object_assert 'pod valid-pod' "{{(index .spec.containers 0).name}}" 'replaced-k8s-serve-hostname'
-  rm tmp-valid-pod.json
+  #cleaning
+  rm /tmp/tmp-valid-pod.json
+
+  ## kubectl edit can update the image field of a POD. tmp-editor.sh is a fake editor
+  echo -e '#!/bin/bash\nsed -i "s/kubernetes\/pause/gcr.io\/google_containers\/serve_hostname/g" $1' > /tmp/tmp-editor.sh
+  chmod +x /tmp/tmp-editor.sh
+  EDITOR=/tmp/tmp-editor.sh kubectl edit "${kube_flags[@]}" pods/valid-pod
+  # Post-condition: valid-pod POD has image gcr.io/google_containers/serve_hostname
+  kube::test::get_object_assert pods "{{range.items}}{{$image_field}}:{{end}}" 'gcr.io/google_containers/serve_hostname:'
+  # cleaning
+  rm /tmp/tmp-editor.sh
 
   ### Overwriting an existing label is not permitted
   # Pre-condition: name is valid-pod
@@ -680,11 +695,24 @@ __EOF__
   kubectl delete pod valid-pod "${kube_flags[@]}"
   kubectl delete service frontend{,-2,-3,-4,-5} "${kube_flags[@]}"
 
-  ### Perform a rolling update with --image
+  ### Expose negative invalid resource test
+  # Pre-condition: don't need
   # Command
-  kubectl rolling-update frontend --image=kubernetes/pause --update-period=10ns --poll-interval=10ms "${kube_flags[@]}"
-  # Post-condition: current image IS kubernetes/pause
-  kube::test::get_object_assert 'rc frontend' '{{range \$c:=$rc_container_image_field}} {{\$c.image}} {{end}}' ' +kubernetes/pause +'
+  output_message=$(! kubectl expose nodes 127.0.0.1 2>&1 "${kube_flags[@]}")
+  # Post-condition: the error message has "invalid resource" string
+  kube::test::if_has_string "${output_message}" 'invalid resource'
+
+  ### Try to generate a service with invalid name (exceeding maximum valid size)
+  # Pre-condition: use --name flag
+  output_message=$(! kubectl expose -f hack/testdata/pod-with-large-name.yaml --name=invalid-large-service-name --port=8081 2>&1 "${kube_flags[@]}")
+  # Post-condition: should fail due to invalid name
+  kube::test::if_has_string "${output_message}" 'metadata.name: invalid value'
+  # Pre-condition: default run without --name flag; should succeed by truncating the inherited name
+  output_message=$(kubectl expose -f hack/testdata/pod-with-large-name.yaml --port=8081 2>&1 "${kube_flags[@]}")
+  # Post-condition: inherited name from pod has been truncated
+  kube::test::if_has_string "${output_message}" '\"kubernetes-serve-hostnam\" exposed'
+  # Clean-up
+  kubectl delete svc kubernetes-serve-hostnam "${kube_flags[@]}"
 
   ### Delete replication controller with id
   # Pre-condition: frontend replication controller is running
@@ -712,24 +740,82 @@ __EOF__
   kube::test::get_object_assert rc "{{range.items}}{{$id_field}}:{{end}}" ''
 
   ######################
+  # Multiple Resources #
+  ######################
+
+  kube::log::status "Testing kubectl(${version}:multiple resources)"
+  # TODO: add test for types like ReplicationControllerList, ServiceList
+
+  FILES="hack/testdata/multi-resource-yaml
+  hack/testdata/multi-resource-list
+  hack/testdata/multi-resource-json"
+  YAML=".yaml"
+  JSON=".json"
+  for file in $FILES; do
+    if [ -f $file$YAML ]
+    then
+      file=$file$YAML
+      replace_file="${file%.yaml}-modify.yaml"
+    else
+      file=$file$JSON
+      replace_file="${file%.json}-modify.json"
+    fi
+
+    ### Create, get, describe, replace, label, annotate, and then delete service nginxsvc and replication controller my-nginx from 3 types of files:
+    ### 1) YAML, separated by ---; 2) JSON, with a List type; 3) JSON, with JSON object concatenation
+    # Pre-condition: no service (other than default kubernetes services) or replication controller is running
+    kube::test::get_object_assert services "{{range.items}}{{$id_field}}:{{end}}" 'kubernetes:'
+    kube::test::get_object_assert rc "{{range.items}}{{$id_field}}:{{end}}" ''
+    # Command
+    # TODO: remove --validate=false when PR "Add validate support for list kind #14726" is merged
+    kubectl create -f $file --validate=false "${kube_flags[@]}"
+    # Post-condition: mock service is running
+    kube::test::get_object_assert services "{{range.items}}{{$id_field}}:{{end}}" 'kubernetes:mock:'
+    # Post-condition: mock rc is running
+    kube::test::get_object_assert rc "{{range.items}}{{$id_field}}:{{end}}" 'mock:'
+    # Command
+    # kubectl create -f $file "${kube_flags[@]}" # test fails here now
+    kubectl get -f $file "${kube_flags[@]}"
+    kubectl describe -f $file "${kube_flags[@]}"
+    # Command
+    # TODO: remove --validate=false when PR "Add validate support for list kind #14726" is merged
+    kubectl replace -f $replace_file --force --validate=false "${kube_flags[@]}"
+    # Post-condition: mock service and mock rc are replaced
+    kube::test::get_object_assert 'services mock' "{{${labels_field}.status}}" 'replaced'
+    kube::test::get_object_assert 'rc mock' "{{${labels_field}.status}}" 'replaced'
+    # Command
+    kubectl label -f $file labeled=true "${kube_flags[@]}"
+    # Post-condition: mock service and mock rc are labeled
+    kube::test::get_object_assert 'services mock' "{{${labels_field}.labeled}}" 'true'
+    kube::test::get_object_assert 'rc mock' "{{${labels_field}.labeled}}" 'true'
+    # Command
+    kubectl annotate -f $file annotated=true "${kube_flags[@]}"
+    # Post-condition: mock service and mock rc are annotated
+    kube::test::get_object_assert 'services mock' "{{${annotations_field}.annotated}}" 'true'
+    kube::test::get_object_assert 'rc mock' "{{${annotations_field}.annotated}}" 'true'
+    # Cleanup services and rc
+    kubectl delete -f $file "${kube_flags[@]}"
+  done
+
+  ######################
   # Persistent Volumes #
   ######################
 
   ### Create and delete persistent volume examples
   # Pre-condition: no persistent volumes currently exist
-  kube::test::get_object_assert pv "{{range.items}}{{.$id_field}}:{{end}}" ''
+  kube::test::get_object_assert pv "{{range.items}}{{$id_field}}:{{end}}" ''
   # Command
   kubectl create -f docs/user-guide/persistent-volumes/volumes/local-01.yaml "${kube_flags[@]}"
-  kube::test::get_object_assert pv "{{range.items}}{{.$id_field}}:{{end}}" 'pv0001:'
+  kube::test::get_object_assert pv "{{range.items}}{{$id_field}}:{{end}}" 'pv0001:'
   kubectl delete pv pv0001 "${kube_flags[@]}"
   kubectl create -f docs/user-guide/persistent-volumes/volumes/local-02.yaml "${kube_flags[@]}"
-  kube::test::get_object_assert pv "{{range.items}}{{.$id_field}}:{{end}}" 'pv0002:'
+  kube::test::get_object_assert pv "{{range.items}}{{$id_field}}:{{end}}" 'pv0002:'
   kubectl delete pv pv0002 "${kube_flags[@]}"
   kubectl create -f docs/user-guide/persistent-volumes/volumes/gce.yaml "${kube_flags[@]}"
-  kube::test::get_object_assert pv "{{range.items}}{{.$id_field}}:{{end}}" 'pv0003:'
+  kube::test::get_object_assert pv "{{range.items}}{{$id_field}}:{{end}}" 'pv0003:'
   kubectl delete pv pv0003 "${kube_flags[@]}"
   # Post-condition: no PVs
-  kube::test::get_object_assert pv "{{range.items}}{{.$id_field}}:{{end}}" ''
+  kube::test::get_object_assert pv "{{range.items}}{{$id_field}}:{{end}}" ''
 
   ############################
   # Persistent Volume Claims #
@@ -737,21 +823,21 @@ __EOF__
 
   ### Create and delete persistent volume claim examples
   # Pre-condition: no persistent volume claims currently exist
-  kube::test::get_object_assert pvc "{{range.items}}{{.$id_field}}:{{end}}" ''
+  kube::test::get_object_assert pvc "{{range.items}}{{$id_field}}:{{end}}" ''
   # Command
   kubectl create -f docs/user-guide/persistent-volumes/claims/claim-01.yaml "${kube_flags[@]}"
-  kube::test::get_object_assert pvc "{{range.items}}{{.$id_field}}:{{end}}" 'myclaim-1:'
+  kube::test::get_object_assert pvc "{{range.items}}{{$id_field}}:{{end}}" 'myclaim-1:'
   kubectl delete pvc myclaim-1 "${kube_flags[@]}"
 
   kubectl create -f docs/user-guide/persistent-volumes/claims/claim-02.yaml "${kube_flags[@]}"
-  kube::test::get_object_assert pvc "{{range.items}}{{.$id_field}}:{{end}}" 'myclaim-2:'
+  kube::test::get_object_assert pvc "{{range.items}}{{$id_field}}:{{end}}" 'myclaim-2:'
   kubectl delete pvc myclaim-2 "${kube_flags[@]}"
 
   kubectl create -f docs/user-guide/persistent-volumes/claims/claim-03.json "${kube_flags[@]}"
-  kube::test::get_object_assert pvc "{{range.items}}{{.$id_field}}:{{end}}" 'myclaim-3:'
+  kube::test::get_object_assert pvc "{{range.items}}{{$id_field}}:{{end}}" 'myclaim-3:'
   kubectl delete pvc myclaim-3 "${kube_flags[@]}"
   # Post-condition: no PVCs
-  kube::test::get_object_assert pvc "{{range.items}}{{.$id_field}}:{{end}}" ''
+  kube::test::get_object_assert pvc "{{range.items}}{{$id_field}}:{{end}}" ''
 
 
 
@@ -819,7 +905,7 @@ kube_api_versions=(
   v1
 )
 for version in "${kube_api_versions[@]}"; do
-  KUBE_API_VERSIONS="v1" runTests "${version}"
+  KUBE_API_VERSIONS="v1,experimental/v1alpha1" runTests "${version}"
 done
 
 kube::log::status "TEST PASSED"

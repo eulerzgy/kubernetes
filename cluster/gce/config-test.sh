@@ -18,9 +18,9 @@
 # gcloud multiplexing for shared GCE/GKE tests.
 GCLOUD=gcloud
 ZONE=${KUBE_GCE_ZONE:-us-central1-b}
-MASTER_SIZE=${MASTER_SIZE:-n1-standard-1}
-MINION_SIZE=${MINION_SIZE:-n1-standard-1}
-NUM_MINIONS=${NUM_MINIONS:-2}
+MASTER_SIZE=${MASTER_SIZE:-n1-standard-2}
+MINION_SIZE=${MINION_SIZE:-n1-standard-2}
+NUM_MINIONS=${NUM_MINIONS:-3}
 MASTER_DISK_TYPE=pd-ssd
 MASTER_DISK_SIZE=${MASTER_DISK_SIZE:-20GB}
 MINION_DISK_TYPE=pd-standard
@@ -45,21 +45,27 @@ MINION_TAG="${INSTANCE_PREFIX}-minion"
 CLUSTER_IP_RANGE="${CLUSTER_IP_RANGE:-10.245.0.0/16}"
 MASTER_IP_RANGE="${MASTER_IP_RANGE:-10.246.0.0/24}"
 MINION_SCOPES="${MINION_SCOPES:-compute-rw,monitoring,logging-write,storage-ro}"
+RUNTIME_CONFIG="${KUBE_RUNTIME_CONFIG:-}"
+ENABLE_EXPERIMENTAL_API="${KUBE_ENABLE_EXPERIMENTAL_API:-false}"
+
 # Increase the sleep interval value if concerned about API rate limits. 3, in seconds, is the default.
 POLL_SLEEP_INTERVAL=3
 SERVICE_CLUSTER_IP_RANGE="10.0.0.0/16"  # formerly PORTAL_NET
 
 # Optional: Cluster monitoring to setup as part of the cluster bring up:
-#   none     - No cluster monitoring setup
-#   influxdb - Heapster, InfluxDB, and Grafana
-#   google   - Heapster, Google Cloud Monitoring, and Google Cloud Logging
+#   none           - No cluster monitoring setup
+#   influxdb       - Heapster, InfluxDB, and Grafana
+#   google         - Heapster, Google Cloud Monitoring, and Google Cloud Logging
+#   googleinfluxdb - Enable influxdb and google (except GCM)
+#   standalone     - Heapster only. Metrics available via Heapster REST API.
 ENABLE_CLUSTER_MONITORING="${KUBE_ENABLE_CLUSTER_MONITORING:-influxdb}"
 
 TEST_CLUSTER_LOG_LEVEL="${TEST_CLUSTER_LOG_LEVEL:---v=4}"
+TEST_CLUSTER_RESYNC_PERIOD="${TEST_CLUSTER_RESYNC_PERIOD:---min-resync-period=3m}"
 
 KUBELET_TEST_ARGS="--max-pods=100 $TEST_CLUSTER_LOG_LEVEL"
-APISERVER_TEST_ARGS="${TEST_CLUSTER_LOG_LEVEL}"
-CONTROLLER_MANAGER_TEST_ARGS="${TEST_CLUSTER_LOG_LEVEL}"
+APISERVER_TEST_ARGS="--runtime-config=experimental/v1alpha1 ${TEST_CLUSTER_LOG_LEVEL}"
+CONTROLLER_MANAGER_TEST_ARGS="${TEST_CLUSTER_LOG_LEVEL} ${TEST_CLUSTER_RESYNC_PERIOD}"
 SCHEDULER_TEST_ARGS="${TEST_CLUSTER_LOG_LEVEL}"
 KUBEPROXY_TEST_ARGS="${TEST_CLUSTER_LOG_LEVEL}"
 
@@ -83,7 +89,7 @@ DNS_DOMAIN="cluster.local"
 DNS_REPLICAS=1
 
 # Optional: Install cluster docker registry.
-ENABLE_CLUSTER_REGISTRY="${KUBE_ENABLE_CLUSTER_REGISTRY:-true}"
+ENABLE_CLUSTER_REGISTRY="${KUBE_ENABLE_CLUSTER_REGISTRY:-false}"
 CLUSTER_REGISTRY_DISK="${CLUSTER_REGISTRY_DISK:-${INSTANCE_PREFIX}-kube-system-kube-registry}"
 CLUSTER_REGISTRY_DISK_SIZE="${CLUSTER_REGISTRY_DISK_SIZE:-200GB}"
 CLUSTER_REGISTRY_DISK_TYPE_GCE="${CLUSTER_REGISTRY_DISK_TYPE_GCE:-pd-standard}"
@@ -92,7 +98,6 @@ CLUSTER_REGISTRY_DISK_TYPE_GCE="${CLUSTER_REGISTRY_DISK_TYPE_GCE:-pd-standard}"
 ENABLE_CLUSTER_UI="${KUBE_ENABLE_CLUSTER_UI:-true}"
 
 # Optional: Create autoscaler for cluster's nodes.
-# NOT WORKING YET!
 ENABLE_NODE_AUTOSCALER="${KUBE_ENABLE_NODE_AUTOSCALER:-false}"
 if [[ "${ENABLE_NODE_AUTOSCALER}" == "true" ]]; then
   AUTOSCALER_MIN_NODES="${KUBE_AUTOSCALER_MIN_NODES:-1}"
@@ -100,7 +105,20 @@ if [[ "${ENABLE_NODE_AUTOSCALER}" == "true" ]]; then
   TARGET_NODE_UTILIZATION="${KUBE_TARGET_NODE_UTILIZATION:-0.7}"
 fi
 
-ADMISSION_CONTROL=NamespaceLifecycle,NamespaceExists,LimitRanger,SecurityContextDeny,ServiceAccount,ResourceQuota
+# Optional: Enable feature for autoscaling number of pods
+# Experimental feature, not ready for production use.
+ENABLE_HORIZONTAL_POD_AUTOSCALER="${KUBE_ENABLE_HORIZONTAL_POD_AUTOSCALER:-false}"
+if [[ "${ENABLE_HORIZONTAL_POD_AUTOSCALER}" == "true" ]]; then
+  ENABLE_EXPERIMENTAL_API=true
+fi
+
+# Optional: Enable deployment experimental feature, not ready for production use.
+ENABLE_DEPLOYMENTS="${KUBE_ENABLE_DEPLOYMENTS:-false}"
+if [[ "${ENABLE_DEPLOYMENTS}" == "true" ]]; then
+  ENABLE_EXPERIMENTAL_API=true
+fi
+
+ADMISSION_CONTROL=NamespaceLifecycle,LimitRanger,SecurityContextDeny,ServiceAccount,ResourceQuota
 
 # Optional: if set to true kube-up will automatically check for existing resources and clean them up.
 KUBE_UP_AUTOMATIC_CLEANUP=${KUBE_UP_AUTOMATIC_CLEANUP:-false}
@@ -110,3 +128,9 @@ KUBE_UP_AUTOMATIC_CLEANUP=${KUBE_UP_AUTOMATIC_CLEANUP:-false}
 # are pre-installed in the image. Note that currently this logic
 # is only supported in trusty nodes.
 TEST_CLUSTER="${TEST_CLUSTER:-true}"
+
+# OpenContrail networking plugin specific settings
+NETWORK_PROVIDER="${NETWORK_PROVIDER:-none}" # opencontrail
+OPENCONTRAIL_TAG="${OPENCONTRAIL_TAG:-R2.20}"
+OPENCONTRAIL_KUBERNETES_TAG="${OPENCONTRAIL_KUBERNETES_TAG:-master}"
+OPENCONTRAIL_PUBLIC_SUBNET="${OPENCONTRAIL_PUBLIC_SUBNET:-10.1.0.0/16}"

@@ -58,11 +58,13 @@ Familiarity with [pods](pods.md) is suggested.
       - [AWS EBS Example configuration](#aws-ebs-example-configuration)
     - [nfs](#nfs)
     - [iscsi](#iscsi)
+    - [flocker](#flocker)
     - [glusterfs](#glusterfs)
     - [rbd](#rbd)
     - [gitRepo](#gitrepo)
     - [secret](#secret)
     - [persistentVolumeClaim](#persistentvolumeclaim)
+    - [downwardAPI](#downwardapi)
   - [Resources](#resources)
 
 <!-- END MUNGE: GENERATED_TOC -->
@@ -113,6 +115,7 @@ Kubernetes supports several types of Volumes:
    * `awsElasticBlockStore`
    * `nfs`
    * `iscsi`
+   * `flocker`
    * `glusterfs`
    * `rbd`
    * `gitRepo`
@@ -316,6 +319,21 @@ simultaneous readers allowed.
 
 See the [iSCSI example](../../examples/iscsi/) for more details.
 
+### flocker
+
+[Flocker](https://clusterhq.com/flocker) is an open-source clustered container data volume manager. It provides management
+and orchestration of data volumes backed by a variety of storage backends.
+
+A `flocker` volume allows a Flocker dataset to be mounted into a pod. If the
+dataset does not already exist in Flocker, it needs to be created with Flocker
+CLI or the using the Flocker API. If the dataset already exists it will
+reattached by Flocker to the node that the pod is scheduled. This means data
+can be "handed off" between pods as required.
+
+__Important: You must have your own Flocker installation running before you can use it__
+
+See the [Flocker example](../../examples/flocker/) for more details.
+
 ### glusterfs
 
 A `glusterfs` volume allows a [Glusterfs](http://www.gluster.org) (an open
@@ -380,6 +398,13 @@ iSCSI volume) without knowing the details of the particular cloud environment.
 
 See the [PersistentVolumes example](persistent-volumes/) for more
 details.
+
+### downwardAPI
+
+A `downwardAPI` volume is used to make downward API data available to applications.
+It mounts a directory and writes the requested data in plain text files.
+
+See the [`downwardAPI` volume example](downward-api/volume/README.md)  for more details.
 
 ## Resources
 

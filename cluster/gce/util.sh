@@ -39,6 +39,8 @@ KUBE_SKIP_UPDATE=${KUBE_SKIP_UPDATE-"n"}
 # multiple versions of the server are being used in the same project
 # simultaneously (e.g. on Jenkins).
 KUBE_GCS_STAGING_PATH_SUFFIX=${KUBE_GCS_STAGING_PATH_SUFFIX-""}
+# How long (in seconds) to wait for cluster initialization.
+KUBE_CLUSTER_INITIALIZATION_TIMEOUT=${KUBE_CLUSTER_INITIALIZATION_TIMEOUT:-300}
 
 # VERSION_REGEX matches things like "v0.13.1"
 readonly KUBE_VERSION_REGEX="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
@@ -53,6 +55,18 @@ function join_csv {
 
 # Verify prereqs
 function verify-prereqs {
+  if [[ "${ENABLE_EXPERIMENTAL_API}" == "true" ]]; then
+    if [[ -z "${RUNTIME_CONFIG}" ]]; then
+      RUNTIME_CONFIG="experimental/v1alpha1=true"
+    else
+      # TODO: add checking if RUNTIME_CONFIG contains "experimental/v1alpha1=false" and appending "experimental/v1alpha1=true" if not.
+      if echo "${RUNTIME_CONFIG}" | grep -q -v "experimental/v1alpha1=true"; then
+        echo "Experimental API should be turned on, but is not turned on in RUNTIME_CONFIG!" >&2
+        exit 1
+      fi
+    fi
+  fi
+
   local cmd
   for cmd in gcloud gsutil; do
     if ! which "${cmd}" >/dev/null; then
@@ -67,8 +81,8 @@ function verify-prereqs {
         curl https://sdk.cloud.google.com | bash
       fi
       if ! which "${cmd}" >/dev/null; then
-        echo "Can't find ${cmd} in PATH, please fix and retry. The Google Cloud "
-        echo "SDK can be downloaded from https://cloud.google.com/sdk/."
+        echo "Can't find ${cmd} in PATH, please fix and retry. The Google Cloud " >&2
+        echo "SDK can be downloaded from https://cloud.google.com/sdk/." >&2
         exit 1
       fi
     fi
@@ -111,7 +125,7 @@ function find-release-tars {
     SERVER_BINARY_TAR="${KUBE_ROOT}/_output/release-tars/kubernetes-server-linux-amd64.tar.gz"
   fi
   if [[ ! -f "$SERVER_BINARY_TAR" ]]; then
-    echo "!!! Cannot find kubernetes-server-linux-amd64.tar.gz"
+    echo "!!! Cannot find kubernetes-server-linux-amd64.tar.gz" >&2
     exit 1
   fi
 
@@ -120,7 +134,7 @@ function find-release-tars {
     SALT_TAR="${KUBE_ROOT}/_output/release-tars/kubernetes-salt.tar.gz"
   fi
   if [[ ! -f "$SALT_TAR" ]]; then
-    echo "!!! Cannot find kubernetes-salt.tar.gz"
+    echo "!!! Cannot find kubernetes-salt.tar.gz" >&2
     exit 1
   fi
 }
@@ -334,15 +348,21 @@ function create-firewall-rule {
       --target-tags "$3" \
       --allow tcp,udp,icmp,esp,ah,sctp; then
         if (( attempt > 5 )); then
-          echo -e "${color_red}Failed to create firewall rule $1 ${color_norm}"
+          echo -e "${color_red}Failed to create firewall rule $1 ${color_norm}" >&2
           exit 2
         fi
-        echo -e "${color_yellow}Attempt $(($attempt+1)) failed to create firewall rule $1. Retrying.${color_norm}"
+        echo -e "${color_yellow}Attempt $(($attempt+1)) failed to create firewall rule $1. Retrying.${color_norm}" >&2
         attempt=$(($attempt+1))
     else
         break
     fi
   done
+}
+
+# $1: version (required)
+function get-template-name-from-version {
+  # trim template name to pass gce name validation
+  echo "${NODE_INSTANCE_PREFIX}-template-${1}" | cut -c 1-63 | sed 's/[\.\+]/-/g;s/-*$//g'
 }
 
 # Robustly try to create an instance template.
@@ -352,14 +372,15 @@ function create-firewall-rule {
 # $4: The kube-env metadata.
 function create-node-template {
   detect-project
+  local template_name="$1"
 
   # First, ensure the template doesn't exist.
   # TODO(zmerlynn): To make this really robust, we need to parse the output and
   #                 add retries. Just relying on a non-zero exit code doesn't
   #                 distinguish an ephemeral failed call from a "not-exists".
-  if gcloud compute instance-templates describe "$1" --project "${PROJECT}" &>/dev/null; then
+  if gcloud compute instance-templates describe "$template_name" --project "${PROJECT}" &>/dev/null; then
     echo "Instance template ${1} already exists; deleting." >&2
-    if ! gcloud compute instance-templates delete "$1" --project "${PROJECT}" &>/dev/null; then
+    if ! gcloud compute instance-templates delete "$template_name" --project "${PROJECT}" &>/dev/null; then
       echo -e "${color_yellow}Failed to delete existing instance template${color_norm}" >&2
       exit 2
     fi
@@ -372,7 +393,7 @@ function create-node-template {
   fi
   while true; do
     echo "Attempt ${attempt} to create ${1}" >&2
-    if ! gcloud compute instance-templates create "$1" \
+    if ! gcloud compute instance-templates create "$template_name" \
       --project "${PROJECT}" \
       --machine-type "${MINION_SIZE}" \
       --boot-disk-type "${MINION_DISK_TYPE}" \
@@ -386,10 +407,10 @@ function create-node-template {
       --can-ip-forward \
       --metadata-from-file "$3","$4" >&2; then
         if (( attempt > 5 )); then
-          echo -e "${color_red}Failed to create instance template $1 ${color_norm}" >&2
+          echo -e "${color_red}Failed to create instance template $template_name ${color_norm}" >&2
           exit 2
         fi
-        echo -e "${color_yellow}Attempt ${attempt} failed to create instance template $1. Retrying.${color_norm}" >&2
+        echo -e "${color_yellow}Attempt ${attempt} failed to create instance template $template_name. Retrying.${color_norm}" >&2
         attempt=$(($attempt+1))
     else
         break
@@ -412,10 +433,10 @@ function add-instance-metadata {
       --zone "${ZONE}" \
       --metadata "${kvs[@]}"; then
         if (( attempt > 5 )); then
-          echo -e "${color_red}Failed to add instance metadata in ${instance} ${color_norm}"
+          echo -e "${color_red}Failed to add instance metadata in ${instance} ${color_norm}" >&2
           exit 2
         fi
-        echo -e "${color_yellow}Attempt $(($attempt+1)) failed to add metadata in ${instance}. Retrying.${color_norm}"
+        echo -e "${color_yellow}Attempt $(($attempt+1)) failed to add metadata in ${instance}. Retrying.${color_norm}" >&2
         attempt=$(($attempt+1))
     else
         break
@@ -439,10 +460,10 @@ function add-instance-metadata-from-file {
       --zone "${ZONE}" \
       --metadata-from-file "$(join_csv ${kvs[@]})"; then
         if (( attempt > 5 )); then
-          echo -e "${color_red}Failed to add instance metadata in ${instance} ${color_norm}"
+          echo -e "${color_red}Failed to add instance metadata in ${instance} ${color_norm}" >&2
           exit 2
         fi
-        echo -e "${color_yellow}Attempt $(($attempt+1)) failed to add metadata in ${instance}. Retrying.${color_norm}"
+        echo -e "${color_yellow}Attempt $(($attempt+1)) failed to add metadata in ${instance}. Retrying.${color_norm}" >&2
         attempt=$(($attempt+1))
     else
         break
@@ -465,6 +486,7 @@ function write-master-env {
   if [[ "${REGISTER_MASTER_KUBELET:-}" == "true" ]]; then
     KUBELET_APISERVER="${MASTER_NAME}"
   fi
+
   build-kube-env true "${KUBE_TEMP}/master-kube-env.yaml"
 }
 
@@ -521,7 +543,7 @@ function create-certs {
     ./easyrsa build-client-full kubecfg nopass > /dev/null 2>&1) || {
     # If there was an error in the subshell, just die.
     # TODO(roberthbailey): add better error handling here
-    echo "=== Failed to generate certificates: Aborting ==="
+    echo "=== Failed to generate certificates: Aborting ===" >&2
     exit 2
   }
   CERT_DIR="${KUBE_TEMP}/easy-rsa-master/easyrsa3"
@@ -662,7 +684,10 @@ function kube-up {
   fi
 
   write-node-env
-  create-node-instance-template
+
+  local template_name="${NODE_INSTANCE_PREFIX}-template"
+  
+  create-node-instance-template $template_name
 
   gcloud compute instance-groups managed \
       create "${NODE_INSTANCE_PREFIX}-group" \
@@ -670,7 +695,7 @@ function kube-up {
       --zone "${ZONE}" \
       --base-instance-name "${NODE_INSTANCE_PREFIX}" \
       --size "${NUM_MINIONS}" \
-      --template "${NODE_INSTANCE_PREFIX}-template" || true;
+      --template "$template_name" || true;
   gcloud compute instance-groups managed wait-until-stable \
       "${NODE_INSTANCE_PREFIX}-group" \
 			--zone "${ZONE}" \
@@ -681,20 +706,27 @@ function kube-up {
   # Create autoscaler for nodes if requested
   if [[ "${ENABLE_NODE_AUTOSCALER}" == "true" ]]; then
     METRICS=""
+    # Current usage
     METRICS+="--custom-metric-utilization metric=custom.cloudmonitoring.googleapis.com/kubernetes.io/cpu/node_utilization,"
     METRICS+="utilization-target=${TARGET_NODE_UTILIZATION},utilization-target-type=GAUGE "
     METRICS+="--custom-metric-utilization metric=custom.cloudmonitoring.googleapis.com/kubernetes.io/memory/node_utilization,"
     METRICS+="utilization-target=${TARGET_NODE_UTILIZATION},utilization-target-type=GAUGE "
+
+    # Reservation
+    METRICS+="--custom-metric-utilization metric=custom.cloudmonitoring.googleapis.com/kubernetes.io/cpu/node_reservation,"
+    METRICS+="utilization-target=${TARGET_NODE_UTILIZATION},utilization-target-type=GAUGE "
+    METRICS+="--custom-metric-utilization metric=custom.cloudmonitoring.googleapis.com/kubernetes.io/memory/node_reservation,"
+    METRICS+="utilization-target=${TARGET_NODE_UTILIZATION},utilization-target-type=GAUGE "
+
     echo "Creating node autoscaler."
-    gcloud compute instance-groups managed set-autoscaling "${NODE_INSTANCE_PREFIX}-group" --zone "${ZONE}" --project $"{PROJECT}" \
+    gcloud compute instance-groups managed set-autoscaling "${NODE_INSTANCE_PREFIX}-group" --zone "${ZONE}" --project "${PROJECT}" \
         --min-num-replicas "${AUTOSCALER_MIN_NODES}" --max-num-replicas "${AUTOSCALER_MAX_NODES}" ${METRICS} || true
   fi
 
-  echo "Waiting for cluster initialization."
+  echo "Waiting up to ${KUBE_CLUSTER_INITIALIZATION_TIMEOUT} seconds for cluster initialization."
   echo
   echo "  This will continually check to see if the API for kubernetes is reachable."
-  echo "  This might loop forever if there was some uncaught error during start"
-  echo "  up."
+  echo "  This may time out if there was some uncaught error during start up."
   echo
 
   # curl in mavericks is borked.
@@ -705,12 +737,17 @@ function kube-up {
     fi
   fi
 
-
+  local start_time=$(date +%s)
   until curl --cacert "${CERT_DIR}/pki/ca.crt" \
           -H "Authorization: Bearer ${KUBE_BEARER_TOKEN}" \
           ${secure} \
           --max-time 5 --fail --output /dev/null --silent \
           "https://${KUBE_MASTER_IP}/api/v1/pods"; do
+      local elapsed=$(($(date +%s) - ${start_time}))
+      if [[ ${elapsed} -gt ${KUBE_CLUSTER_INITIALIZATION_TIMEOUT} ]]; then
+          echo -e "${color_red}Cluster failed to initialize within ${KUBE_CLUSTER_INITIALIZATION_TIMEOUT} seconds.${color_norm}" >&2
+          exit 2
+      fi
       printf "."
       sleep 2
   done
@@ -1025,31 +1062,33 @@ function prepare-push() {
 
     # Ugly hack: Since it is not possible to delete instance-template that is currently
     # being used, create a temp one, then delete the old one and recreate it once again.
-    create-node-instance-template "tmp"
+    local tmp_template_name="${NODE_INSTANCE_PREFIX}-template-tmp"
+    create-node-instance-template $tmp_template_name
 
+    local template_name="${NODE_INSTANCE_PREFIX}-template"
     gcloud compute instance-groups managed \
       set-instance-template "${NODE_INSTANCE_PREFIX}-group" \
-      --template "${NODE_INSTANCE_PREFIX}-template-tmp" \
+      --template "$tmp_template_name" \
       --zone "${ZONE}" \
       --project "${PROJECT}" || true;
 
     gcloud compute instance-templates delete \
       --project "${PROJECT}" \
       --quiet \
-      "${NODE_INSTANCE_PREFIX}-template" || true
+      "$template_name" || true
 
-    create-node-instance-template
+    create-node-instance-template "$template_name"
 
     gcloud compute instance-groups managed \
       set-instance-template "${NODE_INSTANCE_PREFIX}-group" \
-      --template "${NODE_INSTANCE_PREFIX}-template" \
+      --template "$template_name" \
       --zone "${ZONE}" \
       --project "${PROJECT}" || true;
 
     gcloud compute instance-templates delete \
       --project "${PROJECT}" \
       --quiet \
-      "${NODE_INSTANCE_PREFIX}-template-tmp" || true
+      "$tmp_template_name" || true
   fi
 }
 

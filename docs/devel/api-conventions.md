@@ -33,7 +33,7 @@ Documentation for other releases can be found at
 API Conventions
 ===============
 
-Updated: 8/24/2015
+Updated: 10/8/2015
 
 *This document is oriented at users who want a deeper understanding of the Kubernetes
 API structure, and developers wanting to extend the Kubernetes API.  An introduction to
@@ -172,7 +172,7 @@ When a new version of an object is POSTed or PUT, the "spec" is updated and avai
 
 The Kubernetes API also serves as the foundation for the declarative configuration schema for the system. In order to facilitate level-based operation and expression of declarative configuration, fields in the specification should have declarative rather than imperative names and semantics -- they represent the desired state, not actions intended to yield the desired state.
 
-The PUT and POST verbs on objects will ignore the "status" values. A `/status` subresource is provided to enable system components to update statuses of resources they manage.
+The PUT and POST verbs on objects MUST ignore the "status" values, to avoid accidentally overwriting the status in read-modify-write scenarios. A `/status` subresource MUST be provided to enable system components to update statuses of resources they manage.
 
 Otherwise, PUT expects the whole object to be specified. Therefore, if a field is omitted it is assumed that the client wants to clear that field's value. The PUT verb does not accept partial updates. Modification of just part of an object may be achieved by GETting the resource, modifying part of the spec, labels, or annotations, and then PUTting it back. See [concurrency control](#concurrency-control-and-consistency), below, regarding read-modify-write consistency when using this pattern. Some objects may expose alternative resource representations that allow mutation of the status, or performing custom actions on the object.
 
@@ -189,8 +189,8 @@ The `FooCondition` type for some resource type `Foo` may include a subset of the
 ```golang
 	Type               FooConditionType  `json:"type" description:"type of Foo condition"`
 	Status             ConditionStatus   `json:"status" description:"status of the condition, one of True, False, Unknown"`
-	LastHeartbeatTime  util.Time         `json:"lastHeartbeatTime,omitempty" description:"last time we got an update on a given condition"`
-	LastTransitionTime util.Time         `json:"lastTransitionTime,omitempty" description:"last time the condition transit from one status to another"`
+	LastHeartbeatTime  unversioned.Time         `json:"lastHeartbeatTime,omitempty" description:"last time we got an update on a given condition"`
+	LastTransitionTime unversioned.Time         `json:"lastTransitionTime,omitempty" description:"last time the condition transit from one status to another"`
 	Reason             string            `json:"reason,omitempty" description:"one-word CamelCase reason for the condition's last transition"`
 	Message            string            `json:"message,omitempty" description:"human-readable message indicating details about last transition"`
 ```
@@ -679,7 +679,7 @@ Accumulate repeated events in the client, especially for frequent events, to red
 ## Naming conventions
 
 * Go field names must be CamelCase. JSON field names must be camelCase. Other than capitalization of the initial letter, the two should almost always match. No underscores nor dashes in either.
-* Field and resource names should be declarative, not imperative (DoSomething, SomethingDoer).
+* Field and resource names should be declarative, not imperative (DoSomething, SomethingDoer, DoneBy, DoneAt).
 * `Minion` has been deprecated in favor of `Node`. Use `Node` where referring to the node resource in the context of the cluster. Use `Host` where referring to properties of the individual physical/virtual system, such as `hostname`, `hostPath`, `hostNetwork`, etc.
 * `FooController` is a deprecated kind naming convention. Name the kind after the thing being controlled instead (e.g., `Job` rather than `JobController`).
 * The name of a field that specifies the time at which `something` occurs should be called `somethingTime`. Do not use `stamp` (e.g., `creationTimestamp`).
@@ -690,6 +690,7 @@ Accumulate repeated events in the client, especially for frequent events, to red
 * Do not use abbreviations in the API, except where they are extremely commonly used, such as "id", "args", or "stdin".
 * Acronyms should similarly only be used when extremely commonly known. All letters in the acronym should have the same case, using the appropriate case for the situation. For example, at the beginning of a field name, the acronym should be all lowercase, such as "httpGet". Where used as a constant, all letters should be uppercase, such as "TCP" or "UDP".
 * The name of a field referring to another resource of kind `Foo` by name should be called `fooName`. The name of a field referring to another resource of kind `Foo` by ObjectReference (or subset thereof) should be called `fooRef`.
+* More generally, include the units and/or type in the field name if they could be ambiguous and they are not specified by the value or value type.
 
 ## Label, selector, and annotation conventions
 
@@ -711,7 +712,14 @@ Therefore, resources supporting auto-generation of unique labels should have a `
 
 Annotations have very different intended usage from labels. We expect them to be primarily generated and consumed by tooling and system extensions. I'm inclined to generalize annotations to permit them to directly store arbitrary json. Rigid names and name prefixes make sense, since they are analogous to API fields.
 
-In fact, experimental API fields, including to represent fields of newer alpha/beta API versions in the older, stable storage version, may be represented as annotations with the prefix `experimental.kubernetes.io/`.
+In fact, experimental API fields, including those used to represent fields of newer alpha/beta API versions in the older stable storage version, may be represented as annotations with the form `something.experimental.kubernetes.io/name`.  For example `net.experimental.kubernetes.io/policy` might represent an experimental network policy field.
+
+Other advice regarding use of labels, annotations, and other generic map keys by Kubernetes components and tools:
+  - Key names should be all lowercase, with words separated by dashes, such as `desired-replicas`
+  - Prefix the key with `kubernetes.io/` or `foo.kubernetes.io/`, preferably the latter if the label/annotation is specific to `foo`
+    - For instance, prefer `service-account.kubernetes.io/name` over `kubernetes.io/service-account.name`
+  - Use annotations to store API extensions that the controller responsible for the resource doesn't need to know about, experimental fields that aren't intended to be generally used API fields, etc. Beware that annotations aren't automatically handled by the API conversion machinery.
+
 
 
 <!-- BEGIN MUNGE: GENERATED_ANALYTICS -->

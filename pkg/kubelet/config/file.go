@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/kubelet"
+	kubeletTypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/util"
 
 	"github.com/golang/glog"
@@ -66,7 +66,7 @@ func (s *sourceFile) extractFromPath() error {
 			return err
 		}
 		// Emit an update with an empty PodList to allow FileSource to be marked as seen
-		s.updates <- kubelet.PodUpdate{Pods: []*api.Pod{}, Op: kubelet.SET, Source: kubelet.FileSource}
+		s.updates <- kubeletTypes.PodUpdate{Pods: []*api.Pod{}, Op: kubeletTypes.SET, Source: kubeletTypes.FileSource}
 		return fmt.Errorf("path does not exist, ignoring")
 	}
 
@@ -76,14 +76,14 @@ func (s *sourceFile) extractFromPath() error {
 		if err != nil {
 			return err
 		}
-		s.updates <- kubelet.PodUpdate{Pods: pods, Op: kubelet.SET, Source: kubelet.FileSource}
+		s.updates <- kubeletTypes.PodUpdate{Pods: pods, Op: kubeletTypes.SET, Source: kubeletTypes.FileSource}
 
 	case statInfo.Mode().IsRegular():
 		pod, err := s.extractFromFile(path)
 		if err != nil {
 			return err
 		}
-		s.updates <- kubelet.PodUpdate{Pods: []*api.Pod{pod}, Op: kubelet.SET, Source: kubelet.FileSource}
+		s.updates <- kubeletTypes.PodUpdate{Pods: []*api.Pod{pod}, Op: kubeletTypes.SET, Source: kubeletTypes.FileSource}
 
 	default:
 		return fmt.Errorf("path is not a directory or file")
@@ -92,8 +92,8 @@ func (s *sourceFile) extractFromPath() error {
 	return nil
 }
 
-// Get as many pod configs as we can from a directory.  Return an error iff something
-// prevented us from reading anything at all.  Do not return an error if only some files
+// Get as many pod configs as we can from a directory. Return an error if and only if something
+// prevented us from reading anything at all. Do not return an error if only some files
 // were problematic.
 func (s *sourceFile) extractFromDir(name string) ([]*api.Pod, error) {
 	dirents, err := filepath.Glob(filepath.Join(name, "[^.]*"))
